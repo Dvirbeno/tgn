@@ -22,10 +22,10 @@ class TGN(torch.nn.Module):
                  dropout=0.1,
                  message_dimension=100,
                  memory_dimension=500,
+                 temporal_dim=100,
                  embedding_module_type="graph_attention",
                  message_function="mlp",
-                 mean_time_shift_src=0, std_time_shift_src=1,
-                 mean_time_shift_dst=0, std_time_shift_dst=1,
+                 mean_time_shift=0, std_time_shift=1,
                  n_neighbors=None,
                  aggregator_type="last",
                  memory_updater_type="gru",
@@ -39,6 +39,7 @@ class TGN(torch.nn.Module):
 
         self.n_edge_features = n_edge_features
         self.n_node_features = n_node_features
+        self.temporal_dim = temporal_dim
         self.n_nodes = n_nodes
 
         self.embedding_dimension = self.n_node_features
@@ -47,13 +48,11 @@ class TGN(torch.nn.Module):
         self.use_destination_embedding_in_message = use_destination_embedding_in_message
         self.use_source_embedding_in_message = use_source_embedding_in_message
 
-        self.time_encoder = TimeEncode(dimension=self.n_node_features)
+        self.time_encoder = TimeEncode(dimension=self.temporal_dim)
         self.memory = None
 
-        self.mean_time_shift_src = mean_time_shift_src
-        self.std_time_shift_src = std_time_shift_src
-        self.mean_time_shift_dst = mean_time_shift_dst
-        self.std_time_shift_dst = std_time_shift_dst
+        self.mean_time_shift = mean_time_shift
+        self.std_time_shift = std_time_shift
 
         self.memory_dimension = memory_dimension
         raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + \
