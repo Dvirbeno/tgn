@@ -2,6 +2,8 @@ import argparse
 import traceback
 import time
 import copy
+import pickle
+import os
 
 import numpy as np
 import dgl
@@ -153,7 +155,15 @@ if __name__ == "__main__":
     device_string = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device_string)
 
-    gs, _ = dgl.load_graphs('/mnt/DS_SHARED/users/dvirb/data/research/graphs/games/pubg/small_ffa.bin')
+    data_path = os.path.normpath('/mnt/DS_SHARED/users/dvirb/data/research/graphs/games/pubg')
+    meta_file = os.path.join(data_path, 'small_meta.pickle')
+    if os.path.exists(meta_file):
+        with open(meta_file, 'rb') as handle:
+            loaded_meta = pickle.load(handle)
+    else:
+        loaded_meta = None
+
+    gs, _ = dgl.load_graphs(os.path.join(data_path, 'small_ffa.bin'))
     data = gs[0]
 
     # reverse the edges
@@ -268,28 +278,26 @@ if __name__ == "__main__":
         match_indicator = srcs if is_match_source else dsts
 
         train_seed[etype] = eids[train_bool[etype]]
-        # train_batch_sampler = decompose_batches(match_indicator[train_bool[etype]])
-        train_batch_sampler = [
-            [1992222, 1992223, 1992224, 1992225, 1992226, 1992227, 1992228, 1992229, 1992230, 1992231, 1992232, 1992233,
-             1992234, 1992235, 1992236, 1992237, 1992238, 1992239, 1992240, 1992241, 1992242, 1992243, 1992244, 1992245,
-             1992246, 1992247, 1992248, 1992249, 1992250, 1992251, 1992252, 1992253, 1992254, 1992255, 1992256, 1992257,
-             1992258, 1992259, 1992260, 1992261, 1992262, 1992263, 1992264, 1992265, 1992266, 1992267, 1992268, 1992269,
-             1992270, 1992271, 1992272, 1992273, 1992274, 1992275, 1992276, 1992277, 1992278, 1992279, 1992280, 1992281,
-             1992282, 1992283, 1992284, 1992285, 1992286, 1992287, 1992288, 1992289, 1992290, 1992291, 1992292, 1992293,
-             1992294, 1992295, 1992296, 1992297, 1992298, 1992299, 1992300, 1992301, 1992302, 1992303, 1992304, 1992305,
-             1992306, 1992307, 1992308, 1992309, 1992310, 1992311, 1992312, 1992313, 1992314, 1992315, 1992316, 1992317,
-             1992318]]
-
         valid_seed[etype] = eids[valid_bool[etype]]
-        # valid_batch_sampler = decompose_batches(match_indicator[valid_bool[etype]])
-
         test_seed[etype] = eids[test_bool[etype]]
-        # test_batch_sampler = decompose_batches(match_indicator[test_bool[etype]])
+
+        if loaded_meta is None:
+            train_batch_sampler = decompose_batches(match_indicator[train_bool[etype]])
+            valid_batch_sampler = decompose_batches(match_indicator[valid_bool[etype]])
+            test_batch_sampler = decompose_batches(match_indicator[test_bool[etype]])
+        else:
+            train_batch_sampler = loaded_meta['train_batch_sampler']
+            valid_batch_sampler = loaded_meta['valid_batch_sampler']
+            test_batch_sampler = loaded_meta['test_batch_sampler']
 
         srcs, dsts, eids = graph_new_node.edges('all', etype=etype)
         match_indicator = srcs if is_match_source else dsts
         test_new_node_seed[etype] = eids[test_new_node_bool[etype]]
-        # test_new_node_batch_sampler = decompose_batches(match_indicator[test_new_node_bool[etype]])
+
+        if loaded_meta is None:
+            test_new_node_batch_sampler = decompose_batches(match_indicator[test_new_node_bool[etype]])
+        else:
+            test_new_node_batch_sampler = loaded_meta['test_new_node_batch_sampler']
 
         # currently - because there are just two types of edges, and they are also reversed with the same data,
         # we don't need really need to consider the reverse edges (for the mirror etype) as seeds.
@@ -297,14 +305,17 @@ if __name__ == "__main__":
         break
 
     # Compute time statistics
-    mean_time_shift, std_time_shift = compute_time_statistics(data, edge_type=('player', 'plays', 'match'))
+    if loaded_meta is None:
+        mean_time_shift, std_time_shift = compute_time_statistics(data, edge_type=('player', 'plays', 'match'))
+    else:
+        mean_time_shift, std_time_shift = loaded_meta['mean_time_shift'], loaded_meta['std_time_shift']
 
-    g_sampling = None if args.fast_mode else graph_no_new_node
-    new_node_g_sampling = None if args.fast_mode else graph_new_node
-    if not args.fast_mode:
-        for ntype in data.ntypes:
-            new_node_g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
-            g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
+    # g_sampling = None if args.fast_mode else graph_no_new_node
+    # new_node_g_sampling = None if args.fast_mode else graph_new_node
+    # if not args.fast_mode:
+    #     for ntype in data.ntypes:
+    #         new_node_g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
+    #         g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
 
     # we highly recommend that you always set the num_workers=0, otherwise the sampled subgraph may not be correct.
     reverse_etypes = {
@@ -369,35 +380,37 @@ if __name__ == "__main__":
     assert data.edata['feats'][etypes[0]].shape[1] == data.edata['feats'][etypes[1]].shape[1]
     edge_dim = data.edata['feats'][etypes[0]].shape[1]
 
-    # Initialize Model
-    tgn = TGN(n_edge_features=edge_dim,
-              n_node_features=0,
-              n_nodes=num_lasting_nodes,
-              device=device,
-              n_layers=args.n_layer,
-              n_heads=args.num_heads,
-              dropout=args.drop_out,
-              message_dimension=args.message_dim,
-              memory_dimension=args.memory_dim,
-              embedding_module_type=args.embedding_module,
-              message_function=args.message_function,
-              aggregator_type=args.aggregator,
-              memory_updater_type=args.memory_updater,
-              mean_time_shift_src=mean_time_shift_src, std_time_shift_src=std_time_shift_src,
-              mean_time_shift_dst=mean_time_shift_dst, std_time_shift_dst=std_time_shift_dst,
-              use_destination_embedding_in_message=args.use_destination_embedding_in_message,
-              use_source_embedding_in_message=args.use_source_embedding_in_message,
-              )
+    if loaded_meta is None:
+        with open(meta_file, 'wb') as handle:
+            pickle.dump({
+                'mean_time_shift': mean_time_shift,
+                'std_time_shift': std_time_shift,
+                'train_batch_sampler': train_batch_sampler,
+                'valid_batch_sampler': valid_batch_sampler,
+                'test_batch_sampler': test_batch_sampler,
+                'test_new_node_batch_sampler': test_new_node_batch_sampler
+            },
+                handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-    model = TGN(edge_feat_dim=edge_dim,
-                memory_dim=args.memory_dim,
+    # Initialize Model
+    model = TGN(n_edge_features=edge_dim,
+                n_node_features=0,
+                n_nodes=num_lasting_nodes,
+                device=device,
+                n_layers=args.n_layer,
+                n_heads=args.num_heads,
+                dropout=args.drop_out,
+                message_dimension=args.message_dim,
+                memory_dimension=args.memory_dim,
                 temporal_dim=args.temporal_dim,
-                embedding_dim=args.embedding_dim,
-                num_heads=args.num_heads,
-                num_nodes=num_lasting_nodes,
-                n_neighbors=args.n_neighbors,
+                embedding_module_type=args.embedding_module,
+                message_function=args.message_function,
+                aggregator_type=args.aggregator,
                 memory_updater_type=args.memory_updater,
-                layers=args.k_hop)
+                mean_time_shift=mean_time_shift, std_time_shift=std_time_shift,
+                use_destination_embedding_in_message=args.use_destination_embedding_in_message,
+                use_source_embedding_in_message=args.use_source_embedding_in_message,
+                )
 
     criterion = torch.nn.L1Loss()  # Should be changed to informational loss
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
