@@ -9,9 +9,9 @@ import torch
 
 from model.tgn import TGN
 from utils.dataloading import (FastTemporalEdgeCollator, FastTemporalSampler,
-                         SimpleTemporalEdgeCollator, SimpleTemporalSampler,
-                         TemporalEdgeDataLoader, TemporalSampler, TemporalEdgeCollator)
-
+                               SimpleTemporalEdgeCollator, SimpleTemporalSampler,
+                               TemporalEdgeDataLoader, TemporalSampler, TemporalEdgeCollator)
+from utils.data_processing import compute_time_statistics
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 TRAIN_SPLIT = 0.7
@@ -105,12 +105,17 @@ if __name__ == "__main__":
                         help="Embedding dim for link prediction")
     parser.add_argument("--memory_dim", type=int, default=100,
                         help="dimension of memory")
+    parser.add_argument('--message_dim', type=int, default=100, help='Dimensions of the messages')
     parser.add_argument("--temporal_dim", type=int, default=100,
                         help="Temporal dimension for time encoding")
-    parser.add_argument("--memory_updater", type=str, default='gru',
-                        help="Recurrent unit for memory update")
-    parser.add_argument("--aggregator", type=str, default='last',
-                        help="Aggregation method for memory update")
+    parser.add_argument('--embedding_module', type=str, default="graph_attention", choices=[
+        "graph_attention", "graph_sum", "identity", "time"], help='Type of embedding module')
+    parser.add_argument('--message_function', type=str, default="identity", choices=[
+        "mlp", "identity"], help='Type of message function')
+    parser.add_argument('--memory_updater', type=str, default="gru", choices=[
+        "gru", "rnn"], help='Type of memory updater')
+    parser.add_argument('--aggregator', type=str, default="last", help='Type of message '
+                                                                       'aggregator')
     parser.add_argument("--n_neighbors", type=int, default=10,
                         help="number of neighbors while doing embedding")
     parser.add_argument("--sampling_method", type=str, default='topk',
@@ -127,8 +132,14 @@ if __name__ == "__main__":
                         help="dataset selection wikipedia/reddit")
     parser.add_argument("--k_hop", type=int, default=1,
                         help="sampling k-hop neighborhood")
+    parser.add_argument('--n_layer', type=int, default=1, help='Number of network layers')
+    parser.add_argument('--drop_out', type=float, default=0.1, help='Dropout probability')
     parser.add_argument("--not_use_memory", action="store_true", default=False,
                         help="Enable memory for TGN Model disable memory for TGN Model")
+    parser.add_argument('--use_destination_embedding_in_message', action='store_true',
+                        help='Whether to use the embedding of the destination node as part of the message')
+    parser.add_argument('--use_source_embedding_in_message', action='store_true',
+                        help='Whether to use the embedding of the source node as part of the message')
 
     args = parser.parse_args()
 
@@ -137,6 +148,10 @@ if __name__ == "__main__":
 
     # if args.k_hop != 1:
     #     assert args.simple_mode, "this k-hop parameter only support simple mode"
+
+    # Set device
+    device_string = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device_string)
 
     gs, _ = dgl.load_graphs('/mnt/DS_SHARED/users/dvirb/data/research/graphs/games/pubg/small_ffa.bin')
     data = gs[0]
@@ -279,16 +294,11 @@ if __name__ == "__main__":
         # currently - because there are just two types of edges, and they are also reversed with the same data,
         # we don't need really need to consider the reverse edges (for the mirror etype) as seeds.
         # Hence - break # TODO: consider what to do with it when teams are involved
+        break
 
-    # train_edges_num = (1 + (graph_no_new_node.edata['timestamp'] <= train_last_ts).nonzero()[-1]).item()
-    # train_seed = torch.arange(train_edges_num)
-    # valid_seed = torch.arange(train_edges_num, trainval_div - new_node_eid_delete.size(0))
-    # test_seed = torch.arange(
-    #     trainval_div - new_node_eid_delete.size(0), graph_no_new_node.num_edges())
-    # test_new_node_seed = torch.arange(
-    #     trainval_div - new_node_eid_delete.size(0), graph_new_node.num_edges())
+    # Compute time statistics
+    mean_time_shift, std_time_shift = compute_time_statistics(data, edge_type=('player', 'plays', 'match'))
 
-    # I STOPPED HERE
     g_sampling = None if args.fast_mode else graph_no_new_node
     new_node_g_sampling = None if args.fast_mode else graph_new_node
     if not args.fast_mode:
@@ -301,6 +311,7 @@ if __name__ == "__main__":
         ('player', 'plays', 'match'): ('match', 'played_by', 'player'),
         ('match', 'played_by', 'player'): ('player', 'plays', 'match')
     }
+
     train_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=train_seed,
                                               graph_sampler=sampler,
@@ -357,6 +368,26 @@ if __name__ == "__main__":
     etypes = data.canonical_etypes
     assert data.edata['feats'][etypes[0]].shape[1] == data.edata['feats'][etypes[1]].shape[1]
     edge_dim = data.edata['feats'][etypes[0]].shape[1]
+
+    # Initialize Model
+    tgn = TGN(n_edge_features=edge_dim,
+              n_node_features=0,
+              n_nodes=num_lasting_nodes,
+              device=device,
+              n_layers=args.n_layer,
+              n_heads=args.num_heads,
+              dropout=args.drop_out,
+              message_dimension=args.message_dim,
+              memory_dimension=args.memory_dim,
+              embedding_module_type=args.embedding_module,
+              message_function=args.message_function,
+              aggregator_type=args.aggregator,
+              memory_updater_type=args.memory_updater,
+              mean_time_shift_src=mean_time_shift_src, std_time_shift_src=std_time_shift_src,
+              mean_time_shift_dst=mean_time_shift_dst, std_time_shift_dst=std_time_shift_dst,
+              use_destination_embedding_in_message=args.use_destination_embedding_in_message,
+              use_source_embedding_in_message=args.use_source_embedding_in_message,
+              )
 
     model = TGN(edge_feat_dim=edge_dim,
                 memory_dim=args.memory_dim,
