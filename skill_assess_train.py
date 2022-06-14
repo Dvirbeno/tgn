@@ -32,7 +32,14 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
 
     for input_nodes, pair_g, blocks in dataloader:
         optimizer.zero_grad()
-        pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
+
+        pair_g = pair_g.to(model.device)
+        blocks = [b.to(model.device) for b in blocks]
+
+        source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks)
+
+        # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
+
         loss = criterion(pred_pos, torch.ones_like(pred_pos))
         loss += criterion(pred_neg, torch.zeros_like(pred_neg))
         total_loss += float(loss) * args.batch_size
@@ -310,12 +317,12 @@ if __name__ == "__main__":
     else:
         mean_time_shift, std_time_shift = loaded_meta['mean_time_shift'], loaded_meta['std_time_shift']
 
-    # g_sampling = None if args.fast_mode else graph_no_new_node
-    # new_node_g_sampling = None if args.fast_mode else graph_new_node
-    # if not args.fast_mode:
-    #     for ntype in data.ntypes:
-    #         new_node_g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
-    #         g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
+    g_sampling = None if args.fast_mode else graph_no_new_node
+    new_node_g_sampling = None if args.fast_mode else graph_new_node
+    if not args.fast_mode:
+        for ntype in data.ntypes:
+            new_node_g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
+            g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
 
     # we highly recommend that you always set the num_workers=0, otherwise the sampled subgraph may not be correct.
     reverse_etypes = {
@@ -400,6 +407,7 @@ if __name__ == "__main__":
                 n_layers=args.n_layer,
                 n_heads=args.num_heads,
                 dropout=args.drop_out,
+                embedding_dimension=args.embedding_dim,
                 message_dimension=args.message_dim,
                 memory_dimension=args.memory_dim,
                 temporal_dim=args.temporal_dim,
@@ -420,6 +428,8 @@ if __name__ == "__main__":
         sampler.reset()
     try:
         for i in range(args.epochs):
+            model.memory.__init_memory__()
+
             train_loss = train(model, train_dataloader, sampler,
                                criterion, optimizer, args)
 
