@@ -1,7 +1,8 @@
 import logging
+from collections import defaultdict
 import numpy as np
 import torch
-from collections import defaultdict
+import dgl
 
 from utils.utils import MergeLayer
 from modules.memory import Memory
@@ -20,6 +21,7 @@ class TGN(torch.nn.Module):
                  n_layers=2,
                  n_heads=2,
                  dropout=0.1,
+                 embedding_dimension=100,
                  message_dimension=100,
                  memory_dimension=500,
                  temporal_dim=100,
@@ -42,14 +44,13 @@ class TGN(torch.nn.Module):
         self.temporal_dim = temporal_dim
         self.n_nodes = n_nodes
 
-        self.embedding_dimension = self.n_node_features
+        self.embedding_dimension = embedding_dimension
         self.n_neighbors = n_neighbors
         self.embedding_module_type = embedding_module_type
         self.use_destination_embedding_in_message = use_destination_embedding_in_message
         self.use_source_embedding_in_message = use_source_embedding_in_message
 
-        self.time_encoder = TimeEncode(dimension=self.temporal_dim)
-        self.memory = None
+        self.time_encoder = TimeEncode(dimension=self.temporal_dim).to(self.device)
 
         self.mean_time_shift = mean_time_shift
         self.std_time_shift = std_time_shift
@@ -73,31 +74,28 @@ class TGN(torch.nn.Module):
                                                  message_dimension=message_dimension,
                                                  memory_dimension=self.memory_dimension,
                                                  device=device)
+        #
+        # self.embedding_module = get_embedding_module(module_type=embedding_module_type,
+        #                                              node_features=self.node_raw_features,
+        #                                              edge_features=self.edge_raw_features,
+        #                                              memory=self.memory,
+        #                                              neighbor_finder=self.neighbor_finder,
+        #                                              time_encoder=self.time_encoder,
+        #                                              n_layers=self.n_layers,
+        #                                              n_node_features=self.n_node_features,
+        #                                              n_edge_features=self.n_edge_features,
+        #                                              n_time_features=self.temporal_dim,
+        #                                              embedding_dimension=self.embedding_dimension,
+        #                                              device=self.device,
+        #                                              n_heads=n_heads, dropout=dropout,
+        #                                              n_neighbors=self.n_neighbors)
+        #
+        # # MLP to compute probability on an edge given two node embeddings
+        # self.affinity_score = MergeLayer(self.n_node_features, self.n_node_features,
+        #                                  self.n_node_features,
+        #                                  1)
 
-        self.embedding_module_type = embedding_module_type
-
-        self.embedding_module = get_embedding_module(module_type=embedding_module_type,
-                                                     node_features=self.node_raw_features,
-                                                     edge_features=self.edge_raw_features,
-                                                     memory=self.memory,
-                                                     neighbor_finder=self.neighbor_finder,
-                                                     time_encoder=self.time_encoder,
-                                                     n_layers=self.n_layers,
-                                                     n_node_features=self.n_node_features,
-                                                     n_edge_features=self.n_edge_features,
-                                                     n_time_features=self.n_node_features,
-                                                     embedding_dimension=self.embedding_dimension,
-                                                     device=self.device,
-                                                     n_heads=n_heads, dropout=dropout,
-                                                     n_neighbors=self.n_neighbors)
-
-        # MLP to compute probability on an edge given two node embeddings
-        self.affinity_score = MergeLayer(self.n_node_features, self.n_node_features,
-                                         self.n_node_features,
-                                         1)
-
-    def compute_temporal_embeddings(self, source_nodes, destination_nodes, negative_nodes, edge_times,
-                                    edge_idxs, n_neighbors=20):
+    def compute_temporal_embeddings(self, input_nodes, pair_graph, blocks):
         """
         Compute temporal embeddings for sources, destinations, and negatively sampled destinations.
 
@@ -111,17 +109,25 @@ class TGN(torch.nn.Module):
         :return: Temporal embeddings for sources, destinations and negatives
         """
 
-        n_samples = len(source_nodes)
-        nodes = np.concatenate([source_nodes, destination_nodes, negative_nodes])
-        positives = np.concatenate([source_nodes, destination_nodes])
-        timestamps = np.concatenate([edge_times, edge_times, edge_times])
+        # which edge type? (assuming all edges in the batch are of the same type)
+        for etype in pair_graph.canonical_etypes:
+            if len(pair_graph.edata[dgl.EID][etype]) > 0:
+                break
+        # make sure only a single type of edges is available
+        assert sum([len(pair_graph.edata[dgl.EID][etype]) > 0 for etype in pair_graph.canonical_etypes]) == 1
 
-        memory = None
-        time_diffs = None
+        is_player_dst = etype[-1] == 'player'
+        node_ids_p = pair_graph.nodes['player'].data[dgl.NID]  # only the player related nodes
+        node_ids_m = pair_graph.nodes['match'].data[dgl.NID]  # only the match related nodes
+
+        edge_src, edge_dst = pair_graph.edges(etype=etype)
+        player_node_ids = (node_ids_p[edge_dst] if is_player_dst else node_ids_p[edge_src]).cpu().numpy()
+        match_node_ids = (node_ids_m[edge_src] if is_player_dst else node_ids_m[edge_dst]).cpu().numpy()
+        edge_times = pair_graph.edges[etype].data['timestamp']
 
         # Update memory for all nodes with messages stored in previous batches
         memory, last_update = self.get_updated_memory(list(range(self.n_nodes)),
-                                                      self.memory.messages)
+                                                      self.memory.raw_messages_storage)
 
         ### Compute differences between the time the memory of a node was last updated,
         ### and the time for which we want to compute the embedding of a node
@@ -152,26 +158,21 @@ class TGN(torch.nn.Module):
 
         # Persist the updates to the memory only for sources and destinations (since now we have
         # new messages for them)
-        self.update_memory(positives, self.memory.messages)
+        self.update_memory(positives, self.memory.raw_messages_storage)
 
         assert torch.allclose(memory[positives], self.memory.get_memory(positives), atol=1e-5), \
             "Something wrong in how the memory was updated"
 
         # Remove messages for the positives since we have already updated the memory using them
-        self.memory.clear_messages(positives)
+        self.memory.clear_messages(player_node_ids)
 
-        unique_sources, source_id_to_messages = self.get_raw_messages(source_nodes,
-                                                                      source_node_embedding,
-                                                                      destination_nodes,
-                                                                      destination_node_embedding,
-                                                                      edge_times, edge_idxs)
-        unique_destinations, destination_id_to_messages = self.get_raw_messages(destination_nodes,
-                                                                                destination_node_embedding,
-                                                                                source_nodes,
-                                                                                source_node_embedding,
-                                                                                edge_times, edge_idxs)
-        self.memory.store_raw_messages(unique_sources, source_id_to_messages)
-        self.memory.store_raw_messages(unique_destinations, destination_id_to_messages)
+        raw_messages = self.get_raw_messages(pair_graph,
+                                             etype,
+                                             player_node_ids,
+                                             match_node_ids,
+                                             edge_times
+                                             )
+        self.memory.store_raw_messages(player_node_ids, raw_messages)
 
         return source_node_embedding, destination_node_embedding, negative_node_embedding
 
@@ -231,30 +232,32 @@ class TGN(torch.nn.Module):
 
         return updated_memory, updated_last_update
 
-    def get_raw_messages(self, source_nodes, source_node_embedding, destination_nodes,
-                         destination_node_embedding, edge_times, edge_idxs):
-        edge_times = torch.from_numpy(edge_times).float().to(self.device)
-        edge_features = self.edge_raw_features[edge_idxs]
+    def get_raw_messages(self,
+                         pair_graph,
+                         etype,
+                         player_node_ids,
+                         match_node_ids,
+                         edge_times):
+        edge_features = torch.cat(
+            [pair_graph.edges[etype].data['feats'], pair_graph.edges[etype].data['result'].unsqueeze(dim=1)],
+            dim=1)
 
-        source_memory = self.memory.get_memory(source_nodes) if not \
-            self.use_source_embedding_in_message else source_node_embedding
-        destination_memory = self.memory.get_memory(destination_nodes) if \
-            not self.use_destination_embedding_in_message else destination_node_embedding
+        cur_memory = self.memory.get_memory(player_node_ids)
+        time_delta = edge_times - self.memory.last_update[player_node_ids]
+        time_delta_encoding = self.time_encoder(time_delta.unsqueeze(dim=1)).view(len(
+            player_node_ids), -1)
 
-        source_time_delta = edge_times - self.memory.last_update[source_nodes]
-        source_time_delta_encoding = self.time_encoder(source_time_delta.unsqueeze(dim=1)).view(len(
-            source_nodes), -1)
+        raw_messages = torch.cat([cur_memory, edge_features, time_delta_encoding],
+                                 dim=1)
+        raw_messages_dict = defaultdict(list)
 
-        source_message = torch.cat([source_memory, destination_memory, edge_features,
-                                    source_time_delta_encoding],
-                                   dim=1)
-        messages = defaultdict(list)
-        unique_sources = np.unique(source_nodes)
+        for i in range(len(player_node_ids)):
+            raw_messages_dict[player_node_ids[i]].append({'message_feats': raw_messages[i],
+                                                          'ts': edge_times[i],
+                                                          'match_nid': match_node_ids[i]
+                                                          })
 
-        for i in range(len(source_nodes)):
-            messages[source_nodes[i]].append((source_message[i], edge_times[i]))
-
-        return unique_sources, messages
+        return raw_messages_dict
 
     def set_neighbor_finder(self, neighbor_finder):
         self.neighbor_finder = neighbor_finder
