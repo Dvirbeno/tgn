@@ -72,4 +72,5 @@ class Memory(nn.Module):
 
     def clear_messages(self, nodes):
         for node in nodes:
-            self.raw_messages_storage[node] = []
+            if node in self.raw_messages_storage:
+                del self.raw_messages_storage[node]
