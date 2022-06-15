@@ -56,8 +56,8 @@ class TGN(torch.nn.Module):
         self.std_time_shift = std_time_shift
 
         self.memory_dimension = memory_dimension
-        raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + \
-                                self.time_encoder.dimension
+        raw_message_dimension = self.memory_dimension + (
+                self.n_edge_features + 1) + self.time_encoder.dimension  # (+1) for the result values attachted to feature edges
         message_dimension = message_dimension if message_function != "identity" else raw_message_dimension
         self.memory = Memory(n_nodes=self.n_nodes,
                              memory_dimension=self.memory_dimension,
@@ -68,12 +68,15 @@ class TGN(torch.nn.Module):
                                                          device=device)
         self.message_function = get_message_function(module_type=message_function,
                                                      raw_message_dimension=raw_message_dimension,
-                                                     message_dimension=message_dimension)
+                                                     message_dimension=message_dimension).to(self.device)
         self.memory_updater = get_memory_updater(module_type=memory_updater_type,
                                                  memory=self.memory,
                                                  message_dimension=message_dimension,
                                                  memory_dimension=self.memory_dimension,
-                                                 device=device)
+                                                 device=device).to(self.device)
+
+        # TODO: lose it
+        self.dummy_lin = torch.nn.Linear(self.memory_dimension, 1, device=self.device)
         #
         # self.embedding_module = get_embedding_module(module_type=embedding_module_type,
         #                                              node_features=self.node_raw_features,
