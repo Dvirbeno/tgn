@@ -37,21 +37,20 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
         blocks = [b.to(model.device) for b in blocks]
 
         source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks)
+        # TODO: lose it
+        dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
 
         # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
 
-        loss = criterion(pred_pos, torch.ones_like(pred_pos))
-        loss += criterion(pred_neg, torch.zeros_like(pred_neg))
+        loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
         total_loss += float(loss) * args.batch_size
         retain_graph = True if batch_cnt == 0 and not args.fast_mode else False
-        loss.backward(retain_graph=retain_graph)
+        loss.backward()
         optimizer.step()
-        model.detach_memory()
-        if not args.not_use_memory:
-            model.update_memory(positive_pair_g)
-        if args.fast_mode:
-            sampler.attach_last_update(model.memory.last_update_t)
-        print("Batch: ", batch_cnt, "Time: ", time.time() - last_t)
+
+        model.memory.detach_memory()
+
+        print("Batch: ", batch_cnt, "Time: ", time.time() - last_t, "Loss: ", loss.item())
         last_t = time.time()
         batch_cnt += 1
     return total_loss
