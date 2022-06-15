@@ -26,7 +26,7 @@ class Memory(nn.Module):
         self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                    requires_grad=False)
         self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
-                                        requires_grad=False)
+                                        requires_grad=False).double()
         self.last_match_id = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
                                           requires_grad=False)
 
@@ -65,8 +65,10 @@ class Memory(nn.Module):
         # Detach all stored messages
         for k, v in self.raw_messages_storage.items():
             new_node_messages = []
-            for message in v:
-                new_node_messages.append((message[0].detach(), message[1]))
+            for raw_message in v:
+                new_node_messages.append({raw_message_key: (
+                    raw_message_value.detach() if torch.is_tensor(raw_message_value) else raw_message_value) for
+                    raw_message_key, raw_message_value in raw_message.items()})
 
             self.raw_messages_storage[k] = new_node_messages
 
