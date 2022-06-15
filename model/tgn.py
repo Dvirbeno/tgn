@@ -124,60 +124,53 @@ class TGN(torch.nn.Module):
         node_ids_m = pair_graph.nodes['match'].data[dgl.NID]  # only the match related nodes
 
         edge_src, edge_dst = pair_graph.edges(etype=etype)
-        player_node_ids = (node_ids_p[edge_dst] if is_player_dst else node_ids_p[edge_src]).cpu().numpy()
-        match_node_ids = (node_ids_m[edge_src] if is_player_dst else node_ids_m[edge_dst]).cpu().numpy()
+        batch_player_node_ids = (node_ids_p[edge_dst] if is_player_dst else node_ids_p[edge_src]).cpu().numpy()
+        batch_match_node_ids = (node_ids_m[edge_src] if is_player_dst else node_ids_m[edge_dst]).cpu().numpy()
         edge_times = pair_graph.edges[etype].data['timestamp']
 
+        all_relevant_nodes = np.concatenate([input_nodes['player'].numpy(),
+                                             batch_player_node_ids])
+
         # Update memory for all nodes with messages stored in previous batches
-        memory, last_update = self.get_updated_memory(list(range(self.n_nodes)),
-                                                      self.memory.raw_messages_storage)
+        memory, last_update = self.update_and_get_memory(all_relevant_nodes,
+                                                         batch_player_node_ids)
 
         ### Compute differences between the time the memory of a node was last updated,
         ### and the time for which we want to compute the embedding of a node
-        source_time_diffs = torch.LongTensor(edge_times).to(self.device) - last_update[
-            source_nodes].long()
-        source_time_diffs = (source_time_diffs - self.mean_time_shift_src) / self.std_time_shift_src
-        destination_time_diffs = torch.LongTensor(edge_times).to(self.device) - last_update[
-            destination_nodes].long()
-        destination_time_diffs = (destination_time_diffs - self.mean_time_shift_dst) / self.std_time_shift_dst
-        negative_time_diffs = torch.LongTensor(edge_times).to(self.device) - last_update[
-            negative_nodes].long()
-        negative_time_diffs = (negative_time_diffs - self.mean_time_shift_dst) / self.std_time_shift_dst
-
-        time_diffs = torch.cat([source_time_diffs, destination_time_diffs, negative_time_diffs],
-                               dim=0)
+        time_diffs = edge_times - last_update
+        norm_time_diffs = (time_diffs - self.mean_time_shift) / self.std_time_shift
 
         # Compute the embeddings using the embedding module
-        node_embedding = self.embedding_module.compute_embedding(memory=memory,
-                                                                 source_nodes=nodes,
-                                                                 timestamps=timestamps,
-                                                                 n_layers=self.n_layers,
-                                                                 n_neighbors=n_neighbors,
-                                                                 time_diffs=time_diffs)
+        if False:
+            node_embedding = self.embedding_module.compute_embedding(memory=memory,
+                                                                     source_nodes=nodes,
+                                                                     timestamps=timestamps,
+                                                                     n_layers=self.n_layers,
+                                                                     n_neighbors=n_neighbors,
+                                                                     time_diffs=time_diffs)
 
-        source_node_embedding = node_embedding[:n_samples]
-        destination_node_embedding = node_embedding[n_samples: 2 * n_samples]
-        negative_node_embedding = node_embedding[2 * n_samples:]
+            source_node_embedding = node_embedding[:n_samples]
+            destination_node_embedding = node_embedding[n_samples: 2 * n_samples]
+            negative_node_embedding = node_embedding[2 * n_samples:]
+        else:
+            out_node_embeddings = memory
 
         # Persist the updates to the memory only for sources and destinations (since now we have
-        # new messages for them)
-        self.update_memory(positives, self.memory.raw_messages_storage)
-
-        assert torch.allclose(memory[positives], self.memory.get_memory(positives), atol=1e-5), \
-            "Something wrong in how the memory was updated"
+        # new messages for them) - This is now performed before
+        # self.update_memory(positives, self.memory.raw_messages_storage)
 
         # Remove messages for the positives since we have already updated the memory using them
-        self.memory.clear_messages(player_node_ids)
+        self.memory.clear_messages(all_relevant_nodes)
 
         raw_messages = self.get_raw_messages(pair_graph,
                                              etype,
-                                             player_node_ids,
-                                             match_node_ids,
+                                             batch_player_node_ids,
+                                             batch_match_node_ids,
                                              edge_times
                                              )
-        self.memory.store_raw_messages(player_node_ids, raw_messages)
+        self.memory.store_raw_messages(batch_player_node_ids, raw_messages)
 
-        return source_node_embedding, destination_node_embedding, negative_node_embedding
+        return out_node_embeddings
 
     def compute_edge_probabilities(self, source_nodes, destination_nodes, negative_nodes, edge_times,
                                    edge_idxs, n_neighbors=20):
