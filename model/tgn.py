@@ -216,6 +216,25 @@ class TGN(torch.nn.Module):
         self.memory_updater.update_memory(unique_nodes, unique_messages,
                                           timestamps=unique_timestamps)
 
+    def update_and_get_memory(self, all_relevant_node_ids,
+                              out_node_ids):
+        # Aggregate messages for the same nodes
+        nodes_to_update, raw_message_feats, message_timestamps, connector_node_id = \
+            self.message_aggregator.aggregate(
+                all_relevant_node_ids,
+                self.memory.raw_messages_storage)
+
+        if len(nodes_to_update) > 0:
+            messages = self.message_function.compute_message(raw_message_feats)
+        else:
+            messages = None
+
+        # Update the memory with the aggregated messages
+        self.memory_updater.update_memory(nodes_to_update, messages,
+                                          timestamps=message_timestamps)
+
+        return self.memory.get_memory(out_node_ids), self.memory.last_update[out_node_ids]
+
     def get_updated_memory(self, nodes, messages):
         # Aggregate messages for the same nodes
         unique_nodes, unique_messages, unique_timestamps = \
