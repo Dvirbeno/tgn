@@ -36,7 +36,9 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
         pair_g = pair_g.to(model.device)
         blocks = [b.to(model.device) for b in blocks]
 
-        source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks)
+        source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks,
+                                                                   complete_graph=dataloader.collator.g_sampling)
+
         # TODO: lose it
         dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
 
