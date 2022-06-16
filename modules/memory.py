@@ -36,6 +36,9 @@ class Memory(nn.Module):
         for node in nodes:
             self.raw_messages_storage[node].extend(node_id_to_raw_message[node])
 
+        # sanity check
+        assert max([len(n) for n in self.raw_messages_storage.values()]) <= 1
+
     def get_memory(self, node_ids):
         return self.memory[node_ids, :]
 
