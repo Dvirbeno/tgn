@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 import numpy as np
 import torch
+import torch.nn.functional as F
 import dgl
 
 from utils.utils import MergeLayer
@@ -11,6 +12,7 @@ from modules.message_function import get_message_function
 from modules.memory_updater import get_memory_updater
 from modules.embedding_module import get_embedding_module
 from model.time_encoding import TimeEncode
+from modules.custom import EdgeUpdatingHeteroGraphConv, GNNLayer, TwoLayerHeteroGraphConv
 
 
 class TGN(torch.nn.Module):
@@ -66,6 +68,15 @@ class TGN(torch.nn.Module):
                              device=device)
         self.message_aggregator = get_message_aggregator(aggregator_type=aggregator_type,
                                                          device=device)
+
+        self.raw_message_processor = TwoLayerHeteroGraphConv(player_dim=self.memory_dimension,
+                                                             match_dim=0,
+                                                             edge_dim=(
+                                                                              self.n_edge_features + 1) + self.time_encoder.dimension,
+                                                             activation=F.relu,
+                                                             hidden_dim=message_dimension,
+                                                             out_dim=message_dimension).to(self.device)
+
         self.message_function = get_message_function(module_type=message_function,
                                                      raw_message_dimension=raw_message_dimension,
                                                      message_dimension=message_dimension).to(self.device)
