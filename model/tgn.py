@@ -109,7 +109,7 @@ class TGN(torch.nn.Module):
         #                                  self.n_node_features,
         #                                  1)
 
-    def compute_temporal_embeddings(self, input_nodes, pair_graph, blocks):
+    def compute_temporal_embeddings(self, input_nodes, pair_graph, blocks, complete_graph):
         """
         Compute temporal embeddings for sources, destinations, and negatively sampled destinations.
 
@@ -144,7 +144,8 @@ class TGN(torch.nn.Module):
 
         # Update memory for all nodes with messages stored in previous batches
         memory, last_update = self.update_and_get_memory(all_relevant_nodes,
-                                                         batch_player_node_ids)
+                                                         batch_player_node_ids,
+                                                         complete_graph=complete_graph)
 
         ### Compute differences between the time the memory of a node was last updated,
         ### and the time for which we want to compute the embedding of a node
@@ -224,11 +225,12 @@ class TGN(torch.nn.Module):
                                           timestamps=unique_timestamps)
 
     def update_and_get_memory(self, all_relevant_node_ids,
-                              out_node_ids):
+                              out_node_ids,
+                              complete_graph):
         # Aggregate messages for the same nodes
         nodes_to_update, raw_message_feats, message_timestamps, connector_node_id = \
             self.message_aggregator.aggregate(
-                all_relevant_node_ids,
+                out_node_ids,
                 self.memory.raw_messages_storage)
 
         if len(nodes_to_update) > 0:
