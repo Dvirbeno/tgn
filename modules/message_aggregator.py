@@ -55,7 +55,7 @@ class LastMessageAggregator(MessageAggregator):
         messages_ts = torch.stack(messages_ts) if len(to_update_node_ids) > 0 else []
         connector_node_ids = np.stack(connector_node_ids) if len(to_update_node_ids) > 0 else []
 
-        return to_update_node_ids, messages_feats, messages_ts, connector_node_ids
+        return np.array(to_update_node_ids), messages_feats, messages_ts, connector_node_ids
 
 
 class MeanMessageAggregator(MessageAggregator):
