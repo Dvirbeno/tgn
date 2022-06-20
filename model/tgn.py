@@ -280,10 +280,17 @@ class TGN(torch.nn.Module):
         raw_messages_dict = defaultdict(list)
 
         for i in range(len(player_node_ids)):
-            raw_messages_dict[player_node_ids[i]].append({'message_feats': raw_messages[i],
-                                                          'ts': edge_times[i],
-                                                          'match_nid': match_node_ids[i]
-                                                          })
+            # this hack is meant to make sure we only store a single new raw message at a time per node
+            # TODO: is it still required?
+            raw_messages_dict[player_node_ids[i]] = [{'message_feats': raw_messages[i],
+                                                      'ts': edge_times[i],
+                                                      'match_nid': match_node_ids[i]
+                                                      }]
+
+            # raw_messages_dict[player_node_ids[i]].append({'message_feats': raw_messages[i],
+            #                                               'ts': edge_times[i],
+            #                                               'match_nid': match_node_ids[i]
+            #                                               })
 
         return raw_messages_dict
 
