@@ -78,7 +78,7 @@ class TGN(torch.nn.Module):
                                                              out_dim=message_dimension).to(self.device)
 
         self.message_function = get_message_function(module_type=message_function,
-                                                     raw_message_dimension=raw_message_dimension,
+                                                     raw_message_dimension=message_dimension,
                                                      message_dimension=message_dimension).to(self.device)
         self.memory_updater = get_memory_updater(module_type=memory_updater_type,
                                                  memory=self.memory,
@@ -143,9 +143,9 @@ class TGN(torch.nn.Module):
                                              batch_player_node_ids])
 
         # Update memory for all nodes with messages stored in previous batches
-        memory, last_update = self.update_and_get_memory(all_relevant_nodes,
-                                                         batch_player_node_ids,
-                                                         complete_graph=complete_graph)
+        memory, last_update, updated_nodes = self.update_and_get_memory(all_relevant_nodes,
+                                                                        batch_player_node_ids,
+                                                                        complete_graph=complete_graph)
 
         ### Compute differences between the time the memory of a node was last updated,
         ### and the time for which we want to compute the embedding of a node
@@ -172,7 +172,7 @@ class TGN(torch.nn.Module):
         # self.update_memory(positives, self.memory.raw_messages_storage)
 
         # Remove messages for the positives since we have already updated the memory using them
-        self.memory.clear_messages(all_relevant_nodes)
+        self.memory.clear_messages(updated_nodes)
 
         raw_messages = self.get_raw_messages(pair_graph,
                                              etype,
@@ -180,7 +180,7 @@ class TGN(torch.nn.Module):
                                              batch_match_node_ids,
                                              edge_times
                                              )
-        self.memory.store_raw_messages(batch_player_node_ids, raw_messages)
+        self.memory.store_raw_messages(np.unique(batch_player_node_ids), raw_messages)
 
         return out_node_embeddings
 
