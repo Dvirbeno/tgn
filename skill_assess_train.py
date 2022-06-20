@@ -36,6 +36,22 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
         pair_g = pair_g.to(model.device)
         blocks = [b.to(model.device) for b in blocks]
 
+        # protection against cases in which a single player has more than a single match to the same edge
+        if pair_g.num_nodes('player') != pair_g.num_edges('played_by'):
+            # means that a player has two edges for the same match
+            seen_pid = []
+            delete_eid = []
+            u, v, e = pair_g.edges('all', etype='played_by')
+            for idx_match, idx_player, idx_edge in zip(u, v, e):
+                if idx_player in seen_pid:
+                    delete_eid.append(idx_edge)
+                else:
+                    seen_pid.append(idx_player)
+            delete_eid = torch.stack(delete_eid)
+
+            if len(delete_eid) >= 1:
+                pair_g.remove_edges(delete_eid, 'played_by')
+
         source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks,
                                                                    complete_graph=dataloader.collator.g_sampling)
 
