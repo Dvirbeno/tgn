@@ -37,6 +37,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
 
     # will be used to aggregate batch results and metrics
     records = []
+    cumulative_loss = 0
 
     for input_nodes, pair_g, blocks in dataloader:
         optimizer.zero_grad()
@@ -93,20 +94,18 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
 
             # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
             known_loss = +losses.rankNet(predicted_scores[:, known_edges], true_relevance[:, known_edges])
-            known_loss.backward()
+
+            cumulative_loss += known_loss
 
         else:
             spcc_known = torch.tensor(0)
             ktau_known = [0]
-            loss.backward()
+
+            cumulative_loss += loss
 
         # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
         total_loss += float(loss) * args.batch_size
         retain_graph = True if batch_cnt == 0 and not args.fast_mode else False
-
-        optimizer.step()
-
-        model.memory.detach_memory()
 
         d = {'Batch': batch_cnt,
              'Time': time.time() - last_t,
@@ -127,6 +126,15 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
         print(print_str)
         last_t = time.time()
         batch_cnt += 1
+
+        if batch_cnt % args.backprop_every == 0:
+            cumulative_loss /= args.backprop_every
+            cumulative_loss.backward()
+            optimizer.step()
+
+            cumulative_loss = 0
+            optimizer.zero_grad()
+            model.memory.detach_memory()
 
         if batch_cnt % 100 == 0:
             pd.DataFrame(records).to_csv('records_optall.csv', index=False)
@@ -226,8 +234,11 @@ if __name__ == "__main__":
                         help='Whether to use the embedding of the destination node as part of the message')
     parser.add_argument('--use_source_embedding_in_message', action='store_true',
                         help='Whether to use the embedding of the source node as part of the message')
+    parser.add_argument('--backprop_every', type=int, default=1, help='Every how many batches to '
+                                                                      'backprop')
 
     args = parser.parse_args()
+    print(args)
 
     assert not (
             args.fast_mode and args.simple_mode), "you can only choose one sampling mode"
