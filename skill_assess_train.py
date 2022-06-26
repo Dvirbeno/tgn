@@ -72,27 +72,27 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
 
         # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
         predicted_scores = dummy_pred.unsqueeze(0)
-        true_relevance = 100 + (-pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
+        true_relevance = 100 + (-pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0).float()
         # true_relevance = (pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
 
         # loss = +losses.listMLE(predicted_scores, true_relevance)
-        loss = +losses.altListMLE(predicted_scores, true_relevance)
+        loss = +losses.rankNet(predicted_scores, true_relevance)
 
-        spcc = spearman_corrcoef(predicted_scores, true_relevance.float())
+        spcc = spearman_corrcoef(predicted_scores, true_relevance)
         ktau = stats.kendalltau(predicted_scores.squeeze(0).detach().cpu().numpy(),
-                                true_relevance.float().squeeze(0).detach().cpu().numpy())
+                                true_relevance.squeeze(0).detach().cpu().numpy())
 
         known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
         _, dstnodes = pair_g.edges(etype='played_by')
         p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
         known_edges = model.memory.last_update[p_nid] > 0
         if known_nodes > 1:
-            spcc_known = spearman_corrcoef(predicted_scores[:, known_edges], true_relevance[:, known_edges].float())
+            spcc_known = spearman_corrcoef(predicted_scores[:, known_edges], true_relevance[:, known_edges])
             ktau_known = stats.kendalltau(predicted_scores[:, known_edges].squeeze(0).detach().cpu().numpy(),
-                                          true_relevance[:, known_edges].float().squeeze(0).detach().cpu().numpy())
+                                          true_relevance[:, known_edges].squeeze(0).detach().cpu().numpy())
 
             # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
-            known_loss = +losses.altListMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
+            known_loss = +losses.rankNet(predicted_scores[:, known_edges], true_relevance[:, known_edges])
             known_loss.backward()
 
         else:
