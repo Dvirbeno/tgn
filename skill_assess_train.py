@@ -6,15 +6,20 @@ import pickle
 import os
 
 import numpy as np
+from scipy import stats
 import dgl
 import torch
+import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from allrank.models import losses
+from torchmetrics.functional import spearman_corrcoef
 
 from model.tgn import TGN
 from utils.dataloading import (FastTemporalEdgeCollator, FastTemporalSampler,
                                SimpleTemporalEdgeCollator, SimpleTemporalSampler,
                                TemporalEdgeDataLoader, TemporalSampler, TemporalEdgeCollator)
 from utils.data_processing import compute_time_statistics
-from sklearn.metrics import average_precision_score, roc_auc_score
 
 TRAIN_SPLIT = 0.7
 VALID_SPLIT = 0.85
@@ -30,11 +35,18 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
     batch_cnt = 0
     last_t = time.time()
 
+    # will be used to aggregate batch results and metrics
+    records = []
+
     for input_nodes, pair_g, blocks in dataloader:
         optimizer.zero_grad()
 
         pair_g = pair_g.to(model.device)
         blocks = [b.to(model.device) for b in blocks]
+
+        # protection - in case there's only a single edge in the subgraph
+        if pair_g.num_edges('played_by') <= 1:
+            continue
 
         # protection against cases in which a single player has more than a single match to the same edge
         if pair_g.num_nodes('player') != pair_g.num_edges('played_by'):
@@ -59,18 +71,66 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
         dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
 
         # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
+        predicted_scores = dummy_pred.unsqueeze(0)
+        true_relevance = 100 + (-pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
+        # true_relevance = (pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
 
-        loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
+        # loss = +losses.listMLE(predicted_scores, true_relevance)
+        loss = +losses.altListMLE(predicted_scores, true_relevance)
+
+        spcc = spearman_corrcoef(predicted_scores, true_relevance.float())
+        ktau = stats.kendalltau(predicted_scores.squeeze(0).detach().cpu().numpy(),
+                                true_relevance.float().squeeze(0).detach().cpu().numpy())
+
+        known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
+        _, dstnodes = pair_g.edges(etype='played_by')
+        p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
+        known_edges = model.memory.last_update[p_nid] > 0
+        if known_nodes > 1:
+            spcc_known = spearman_corrcoef(predicted_scores[:, known_edges], true_relevance[:, known_edges].float())
+            ktau_known = stats.kendalltau(predicted_scores[:, known_edges].squeeze(0).detach().cpu().numpy(),
+                                          true_relevance[:, known_edges].float().squeeze(0).detach().cpu().numpy())
+
+            # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
+            known_loss = +losses.altListMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
+            known_loss.backward()
+
+        else:
+            spcc_known = torch.tensor(0)
+            ktau_known = [0]
+            loss.backward()
+
+        # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
         total_loss += float(loss) * args.batch_size
         retain_graph = True if batch_cnt == 0 and not args.fast_mode else False
-        loss.backward()
+
         optimizer.step()
 
         model.memory.detach_memory()
 
-        print("Batch: ", batch_cnt, "Time: ", time.time() - last_t, "Loss: ", loss.item())
+        d = {'Batch': batch_cnt,
+             'Time': time.time() - last_t,
+             'OverallLoss': loss.item(),
+             'SPcc': spcc.item(),
+             'numKnown': known_nodes.item(),
+             'spcc_known': spcc_known.item(),
+             'ktau': ktau[0],
+             'ktau_known': ktau_known[0]
+             }
+
+        if known_nodes > 1:
+            d.update({'knownLoss': known_loss.item()})
+
+        records.append(d)
+
+        print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
+        print(print_str)
         last_t = time.time()
         batch_cnt += 1
+
+        if batch_cnt % 100 == 0:
+            pd.DataFrame(records).to_csv('records_optall.csv', index=False)
+
     return total_loss
 
 
@@ -438,7 +498,7 @@ if __name__ == "__main__":
                 )
 
     criterion = torch.nn.L1Loss()  # Should be changed to informational loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.00005)
     # Implement Logging mechanism
     f = open("logging.txt", 'w')
     if args.fast_mode:
