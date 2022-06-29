@@ -11,9 +11,9 @@ class GNNLayer(nn.Module):
     def __init__(self, source_dim, dest_dim, edge_dim, activation, hidden_dim, ndim_out, edim_out,
                  ignore_srcdata=False, ignore_dstdata=False):
         super(GNNLayer, self).__init__()
-        self.W_msg = nn.Linear(source_dim + edge_dim, hidden_dim).double()
-        self.W_apply = nn.Linear(dest_dim + ndim_out, ndim_out).double()
-        self.W_edge = nn.Linear(source_dim + edge_dim + hidden_dim, edim_out).double()
+        self.W_msg = nn.Linear(source_dim + edge_dim, hidden_dim)
+        self.W_apply = nn.Linear(dest_dim + ndim_out, ndim_out)
+        self.W_edge = nn.Linear(source_dim + edge_dim + hidden_dim, edim_out)
         self.activation = activation
         self.ignore_srcdata = ignore_srcdata
         self.ignore_dstdata = ignore_dstdata

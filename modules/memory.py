@@ -26,7 +26,7 @@ class Memory(nn.Module):
         self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                    requires_grad=False)
         self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
-                                        requires_grad=False).double()
+                                        requires_grad=False)
         self.last_match_id = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
                                           requires_grad=False)
 
