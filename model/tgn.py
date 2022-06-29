@@ -86,6 +86,13 @@ class TGN(torch.nn.Module):
                                                  memory_dimension=self.memory_dimension,
                                                  device=device).to(self.device)
 
+        # self.pre_attn_lin_q = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
+        # self.pre_attn_lin_k = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
+        # self.pre_attn_lin_v = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
+
+        self.output_attn = torch.nn.MultiheadAttention(embed_dim=memory_dimension, num_heads=1,
+                                                       batch_first=True, add_bias_kv=True).to(self.device)
+
         # TODO: lose it
         self.dummy_lin = torch.nn.Linear(self.memory_dimension, 1, device=self.device)
         #

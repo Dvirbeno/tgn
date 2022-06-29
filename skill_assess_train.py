@@ -9,6 +9,7 @@ import numpy as np
 from scipy import stats
 import dgl
 import torch
+import torch.nn.functional as F
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
@@ -29,7 +30,7 @@ np.random.seed(2021)
 torch.manual_seed(2021)
 
 
-def train(model, dataloader, sampler, criterion, optimizer, args):
+def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
     model.train()
     total_loss = 0
     batch_cnt = 0
@@ -67,33 +68,37 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
 
         source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks,
                                                                    complete_graph=dataloader.collator.g_sampling)
+        known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
+        _, dstnodes = pair_g.edges(etype='played_by')
+        p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
+        known_edges = model.memory.last_update[p_nid] > 0
 
-        # TODO: lose it
         dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
 
         # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
         predicted_scores = dummy_pred.unsqueeze(0)
-        true_relevance = 100 + (-pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0).float()
+        true_relevance = pair_g.edata['result'][('match', 'played_by', 'player')].unsqueeze(0)
         # true_relevance = (pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
 
         # loss = +losses.listMLE(predicted_scores, true_relevance)
-        loss = +losses.rankNet(predicted_scores, true_relevance)
+        loss = losses.rankNet(predicted_scores, true_relevance)
 
         spcc = spearman_corrcoef(predicted_scores, true_relevance)
         ktau = stats.kendalltau(predicted_scores.squeeze(0).detach().cpu().numpy(),
                                 true_relevance.squeeze(0).detach().cpu().numpy())
 
-        known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
-        _, dstnodes = pair_g.edges(etype='played_by')
-        p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
-        known_edges = model.memory.last_update[p_nid] > 0
         if known_nodes > 1:
-            spcc_known = spearman_corrcoef(predicted_scores[:, known_edges], true_relevance[:, known_edges])
-            ktau_known = stats.kendalltau(predicted_scores[:, known_edges].squeeze(0).detach().cpu().numpy(),
-                                          true_relevance[:, known_edges].squeeze(0).detach().cpu().numpy())
+            targets = true_relevance[:, known_edges]
+
+            pred_known = torch.squeeze(model.dummy_lin(source_node_embeddings[known_edges])).unsqueeze(0)
+
+            spcc_known = spearman_corrcoef(pred_known, targets)
+            ktau_known = stats.kendalltau(pred_known.squeeze(0).detach().cpu().numpy(),
+                                          targets.squeeze(0).detach().cpu().numpy())
 
             # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
-            known_loss = +losses.rankNet(predicted_scores[:, known_edges], true_relevance[:, known_edges])
+            known_loss = losses.rankNet(pred_known, targets)
+            # known_loss = +losses.marginRankNet(pred_known, targets)
 
             cumulative_loss += known_loss
 
@@ -101,7 +106,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
             spcc_known = torch.tensor(0)
             ktau_known = [0]
 
-            cumulative_loss += loss
+            # cumulative_loss += loss #TODO: commented out temporarily
 
         # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
         total_loss += float(loss) * args.batch_size
@@ -137,7 +142,9 @@ def train(model, dataloader, sampler, criterion, optimizer, args):
             model.memory.detach_memory()
 
         if batch_cnt % 100 == 0:
-            pd.DataFrame(records).to_csv('records_optall.csv', index=False)
+            output_dir = os.path.join(os.getcwd(), 'marginranking')
+            if not os.path.exists(output_dir): os.makedirs(output_dir)
+            pd.DataFrame(records).to_csv(os.path.join(output_dir, f"{epoch_idx}.csv"), index=False)
 
     return total_loss
 
@@ -519,7 +526,7 @@ if __name__ == "__main__":
             model.memory.__init_memory__()
 
             train_loss = train(model, train_dataloader, sampler,
-                               criterion, optimizer, args)
+                               criterion, optimizer, args, epoch_idx=i)
 
             val_ap, val_auc = test_val(
                 model, valid_dataloader, sampler, criterion, args)
