@@ -106,7 +106,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
             spcc_known = torch.tensor(0)
             ktau_known = [0]
 
-            # cumulative_loss += loss #TODO: commented out temporarily
+            # cumulative_loss += loss  # TODO: commented out temporarily
 
         # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
         total_loss += float(loss) * args.batch_size
@@ -142,7 +142,8 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
             model.memory.detach_memory()
 
         if batch_cnt % 100 == 0:
-            output_dir = os.path.join(os.getcwd(), 'marginranking')
+            output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
+                                      'improved_arch_optall')
             if not os.path.exists(output_dir): os.makedirs(output_dir)
             pd.DataFrame(records).to_csv(os.path.join(output_dir, f"{epoch_idx}.csv"), index=False)
 
@@ -516,7 +517,7 @@ if __name__ == "__main__":
                 )
 
     criterion = torch.nn.L1Loss()  # Should be changed to informational loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.00005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     # Implement Logging mechanism
     f = open("logging.txt", 'w')
     if args.fast_mode:
