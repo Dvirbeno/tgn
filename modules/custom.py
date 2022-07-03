@@ -9,46 +9,61 @@ import torch.nn.functional as F
 
 class GNNLayer(nn.Module):
     def __init__(self, source_dim, dest_dim, edge_dim, activation, hidden_dim, ndim_out, edim_out,
+                 reduce_fn=fn.mean,
                  ignore_srcdata=False, ignore_dstdata=False):
         super(GNNLayer, self).__init__()
-        self.W_msg = nn.Linear(source_dim + edge_dim, hidden_dim)
-        self.W_apply = nn.Linear(dest_dim + ndim_out, ndim_out)
+        self.W_msg = nn.Linear(source_dim + edge_dim + dest_dim, hidden_dim)
+        self.W_apply = nn.Linear(dest_dim + hidden_dim + edim_out, ndim_out)
         self.W_edge = nn.Linear(source_dim + edge_dim + hidden_dim, edim_out)
         self.activation = activation
+        self.reduce_fn = reduce_fn
         self.ignore_srcdata = ignore_srcdata
         self.ignore_dstdata = ignore_dstdata
 
         if ignore_srcdata:
             self.message_func = self.message_func_ignoring_src
             self.f_edge = self.f_edge_ignoring_src
+            self.f_apply = self.apply_func
+        elif ignore_dstdata:
+            self.message_func = self.message_func_ignoring_dst
+            self.f_edge = self.default_f_edge
+            self.f_apply = self.apply_func_ignore_dst
         else:
             self.message_func = self.default_message_func
             self.f_edge = self.default_f_edge
+            self.f_apply = self.apply_func
 
     def default_message_func(self, edges):
-        return {'m': self.activation(self.W_msg(torch.cat([edges.src['h'], edges.data['h']], 1)))}
+        return {'m': self.activation(self.W_msg(torch.cat([edges.src['h'], edges.data['h'], edges.dst['h']], 1)))}
 
     def message_func_ignoring_src(self, edges):
-        return {'m': self.activation(self.W_msg(edges.data['h']))}
+        return {'m': self.activation(self.W_msg(torch.cat([edges.data['h'], edges.dst['h']], 1)))}
+
+    def message_func_ignoring_dst(self, edges):
+        return {'m': self.activation(self.W_msg(torch.cat([edges.src['h'], edges.data['h']], 1)))}
 
     def default_f_edge(self, edges):
-        return {'eh': self.W_edge(torch.cat([edges.src['h'], edges.data['h'], edges.dst['h_neigh']], 1))}
+        return {
+            'eh': self.activation(self.W_edge(torch.cat([edges.src['h'], edges.data['h'], edges.dst['h_neigh']], 1)))}
 
     def f_edge_ignoring_src(self, edges):
-        return {'eh': self.W_edge(torch.cat([edges.data['h'], edges.dst['h_neigh']], 1))}
+        return {'eh': self.activation(self.W_edge(torch.cat([edges.data['h'], edges.dst['h_neigh']], 1)))}
+
+    def apply_func_ignore_dst(self, edges):
+        return {'m_out': self.W_apply(torch.cat([edges.dst['h_neigh'], edges.data['eh']], 1))}
+
+    def apply_func(self, edges):
+        return {'m_out': self.W_apply(torch.cat([edges.dst['h'], edges.dst['h_neigh'], edges.data['eh']], 1))}
 
     def forward(self, g, nfeats, efeats):
         with g.local_scope():
             g.srcdata['h'], g.dstdata['h'] = nfeats
             g.edata['h'] = efeats
-            g.update_all(self.message_func, fn.mean('m', 'h_neigh'))
+            g.update_all(self.message_func, self.reduce_fn('m', 'h_neigh'))
             g.apply_edges(self.f_edge)
+            g.update_all(self.f_apply, self.reduce_fn('m_out', 'h_out'))
 
-            apply_inputs = g.dstdata['h_neigh'] if self.ignore_dstdata else torch.cat(
-                [g.dstdata['h'], g.dstdata['h_neigh']], 1)
-            g.dstdata['h'] = self.W_apply(apply_inputs)
-
-            return g.dstdata['h'], g.edata['eh']
+            return g.dstdata['h_out'], g.edata['eh']
 
 
 class EdgeUpdatingHeteroGraphConv(dglnn.HeteroGraphConv):
