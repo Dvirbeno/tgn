@@ -73,7 +73,7 @@ class TGN(torch.nn.Module):
                                                              match_dim=0,
                                                              edge_dim=(
                                                                               self.n_edge_features + 1) + self.time_encoder.dimension,
-                                                             activation=F.relu,
+                                                             activation=F.elu,
                                                              hidden_dim=message_dimension,
                                                              out_dim=message_dimension).to(self.device)
 
@@ -173,6 +173,7 @@ class TGN(torch.nn.Module):
             negative_node_embedding = node_embedding[2 * n_samples:]
         else:
             out_node_embeddings = memory
+            out_node_embeddings[last_update == 0] = self.memory.default_memory
 
         # Persist the updates to the memory only for sources and destinations (since now we have
         # new messages for them) - This is now performed before
@@ -288,16 +289,22 @@ class TGN(torch.nn.Module):
         propagated_messages_ts = list()
 
         for conn_id in connector_to_players:
-            # get the sub-graph related to the specific match_id we're intersted in
-            connector_subgraph = dgl.merge([
-                dgl.in_subgraph(complete_graph, {'match': [conn_id]}),
-                dgl.out_subgraph(complete_graph, {'match': [conn_id]}),
-            ])
+            connector_subgraph = dgl.in_subgraph(complete_graph, {'match': [conn_id]})
             # remove all the unconnected (isolated) nodes - for getting the "pure" sub-graph:
             connector_subgraph = dgl.remove_nodes(connector_subgraph, (
                     connector_subgraph.in_degrees(etype='plays') == 0).nonzero().squeeze(), ntype='match')
             connector_subgraph = dgl.remove_nodes(connector_subgraph, (
-                    connector_subgraph.in_degrees(etype='played_by') == 0).nonzero().squeeze(), ntype='player')
+                    connector_subgraph.out_degrees(etype='plays') == 0).nonzero().squeeze(), ntype='player')
+
+            rel = connector_subgraph.edge_type_subgraph([('player', 'plays', 'match')])
+            reverse_rel = dgl.reverse(rel, copy_edata=True)
+            reversed_edges = reverse_rel.all_edges()
+            connector_subgraph.add_edges(*reversed_edges, data=reverse_rel.edata,
+                                         etype=('match', 'played_by', 'player'))
+
+            # verify player nodes are ordered similarly on both types of edges
+            assert torch.equal(connector_subgraph.edges(etype='plays')[0],
+                               connector_subgraph.edges(etype='played_by')[-1])
 
             for type_of_edge in connector_subgraph.canonical_etypes:
                 if connector_subgraph.num_nodes('player') != connector_subgraph.num_edges(type_of_edge):
@@ -340,11 +347,22 @@ class TGN(torch.nn.Module):
             connector_subgraph = connector_subgraph.to(self.device)
 
             prev_memory = self.memory.get_memory(affecting_nodes)
-            time_diffs = timestamps - self.memory.last_update[affecting_nodes]
+            last_t = self.memory.last_update[affecting_nodes]
+            prev_memory[last_t == 0] = self.memory.default_memory
+            time_diffs = timestamps - last_t
             encoded_time = self.time_encoder(time_diffs.unsqueeze(1)).squeeze(1)
             edge_feats = torch.cat([connector_subgraph.edges['plays'].data['feats'],
                                     connector_subgraph.edges['plays'].data['result'].unsqueeze(1),
                                     encoded_time], 1)
+
+            # the two edge-related subgraphs (two mods/relations) are not aligned in terms of edges
+            # that was previously the case - we might be able to remove this, when we're sure they are aligned
+            # ======================================================================================
+            # verify that edges are sorted on the first etype
+            src_nid = connector_subgraph.edges(etype='plays')[0].detach().cpu().numpy()
+            assert np.all(src_nid[:-1] < src_nid[1:])
+            dst_nid = connector_subgraph.edges(etype='played_by')[-1]
+            aligned_feats = edge_feats[dst_nid]
 
             nfeats, efeats = self.raw_message_processor(connector_subgraph,
                                                         node_inputs={
@@ -354,7 +372,7 @@ class TGN(torch.nn.Module):
                                                         },
                                                         edge_feats={
                                                             'plays': edge_feats,
-                                                            'played_by': edge_feats
+                                                            'played_by': aligned_feats
                                                         })
 
             all_affected_nodes.append(affecting_nodes)
