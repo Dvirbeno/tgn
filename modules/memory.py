@@ -23,6 +23,9 @@ class Memory(nn.Module):
         Initializes the memory to all zeros. It should be called at the start of each epoch.
         """
         # Treat memory as parameter so that it is saved and loaded together with the model
+        self.default_memory = nn.Parameter(torch.randn(self.memory_dimension).to(self.device),
+                                           requires_grad=True)
+
         self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                    requires_grad=False)
         self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
