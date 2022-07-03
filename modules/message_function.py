@@ -15,9 +15,9 @@ class MLPMessageFunction(MessageFunction):
         super(MLPMessageFunction, self).__init__()
 
         self.mlp = self.layers = nn.Sequential(
-            nn.Linear(raw_message_dimension, raw_message_dimension // 2),
-            nn.ReLU(),
-            nn.Linear(raw_message_dimension // 2, message_dimension),
+            nn.Linear(raw_message_dimension, raw_message_dimension),
+            nn.ELU(),
+            nn.Linear(raw_message_dimension, message_dimension),
         )
 
     def compute_message(self, raw_messages):
