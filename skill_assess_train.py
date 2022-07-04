@@ -21,6 +21,7 @@ from utils.dataloading import (FastTemporalEdgeCollator, FastTemporalSampler,
                                SimpleTemporalEdgeCollator, SimpleTemporalSampler,
                                TemporalEdgeDataLoader, TemporalSampler, TemporalEdgeCollator)
 from utils.data_processing import compute_time_statistics
+from evaluation import metrics
 
 TRAIN_SPLIT = 0.7
 VALID_SPLIT = 0.85
@@ -78,23 +79,20 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
         # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
         predicted_scores = dummy_pred.unsqueeze(0)
         true_relevance = pair_g.edata['result'][('match', 'played_by', 'player')].unsqueeze(0)
-        # true_relevance = (pair_g.edata['result'][('match', 'played_by', 'player')]).unsqueeze(0)
 
         # loss = +losses.listMLE(predicted_scores, true_relevance)
         loss = losses.rankNet(predicted_scores, true_relevance)
 
-        spcc = spearman_corrcoef(predicted_scores, true_relevance)
-        ktau = stats.kendalltau(predicted_scores.squeeze(0).detach().cpu().numpy(),
-                                true_relevance.squeeze(0).detach().cpu().numpy())
+        metrics_all = metrics.calc_metrics(preds=predicted_scores.squeeze(0).detach().cpu().numpy(),
+                                           targets=true_relevance.squeeze(0).detach().cpu().numpy())
 
         if known_nodes > 1:
             targets = true_relevance[:, known_edges]
 
             pred_known = torch.squeeze(model.dummy_lin(source_node_embeddings[known_edges])).unsqueeze(0)
 
-            spcc_known = spearman_corrcoef(pred_known, targets)
-            ktau_known = stats.kendalltau(pred_known.squeeze(0).detach().cpu().numpy(),
-                                          targets.squeeze(0).detach().cpu().numpy())
+            metrics_known = metrics.calc_metrics(preds=pred_known.squeeze(0).detach().cpu().numpy(),
+                                                 targets=targets.squeeze(0).detach().cpu().numpy())
 
             # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
             known_loss = losses.rankNet(pred_known, targets)
@@ -103,9 +101,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
             cumulative_loss += known_loss
 
         else:
-            spcc_known = torch.tensor(0)
-            ktau_known = [0]
-
+            pass
             # cumulative_loss += loss  # TODO: commented out temporarily
 
         # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
@@ -115,20 +111,22 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
         d = {'Batch': batch_cnt,
              'Time': time.time() - last_t,
              'OverallLoss': loss.item(),
-             'SPcc': spcc.item(),
              'numKnown': known_nodes.item(),
-             'spcc_known': spcc_known.item(),
-             'ktau': ktau[0],
-             'ktau_known': ktau_known[0]
              }
+        d.update(metrics_all)
+        print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
+        print(print_str)
 
         if known_nodes > 1:
-            d.update({'knownLoss': known_loss.item()})
+            dict_addition = {'knownLoss': known_loss.item()}
+            dict_addition.update({f"known_{k}": v for k, v in metrics_known.items()})
+            print(' , '.join(f"{k} : {v:0.3f}" for k, v in dict_addition.items()))
+            d.update(dict_addition)
+        else:
+            d.update({'knownLoss': np.nan})
 
         records.append(d)
 
-        print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
-        print(print_str)
         last_t = time.time()
         batch_cnt += 1
 
@@ -143,7 +141,7 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
 
         if batch_cnt % 100 == 0:
             output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
-                                      'improved_arch_optall')
+                                      args.name)
             if not os.path.exists(output_dir): os.makedirs(output_dir)
             pd.DataFrame(records).to_csv(os.path.join(output_dir, f"{epoch_idx}.csv"), index=False)
 
@@ -199,6 +197,7 @@ def decompose_batches(group_indicator):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
+    parser.add_argument('--name', type=str, help='name of experiment', required=True)
     parser.add_argument("--epochs", type=int, default=50,
                         help='epochs for training on entire dataset')
     parser.add_argument("--batch_size", type=int,
@@ -259,14 +258,14 @@ if __name__ == "__main__":
     device = torch.device(device_string)
 
     data_path = os.path.normpath('/mnt/DS_SHARED/users/dvirb/data/research/graphs/games/pubg')
-    meta_file = os.path.join(data_path, 'small_meta.pickle')
+    meta_file = os.path.join(data_path, 'complete_meta.pickle')
     if os.path.exists(meta_file):
         with open(meta_file, 'rb') as handle:
             loaded_meta = pickle.load(handle)
     else:
         loaded_meta = None
 
-    gs, _ = dgl.load_graphs(os.path.join(data_path, 'small_ffa.bin'))
+    gs, _ = dgl.load_graphs(os.path.join(data_path, 'complete_ffa.bin'))
     data = gs[0]
 
     # reverse the edges
