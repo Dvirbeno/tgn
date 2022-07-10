@@ -41,6 +41,12 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
     records = []
     cumulative_loss = 0
 
+    output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
+                              args.name)
+    output_file = os.path.join(output_dir, f"{epoch_idx}.csv")
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    if os.path.exists(output_file):  os.remove(output_file)
+
     for input_nodes, pair_g, blocks in dataloader:
         optimizer.zero_grad()
 
@@ -140,10 +146,10 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
             model.memory.detach_memory()
 
         if batch_cnt % 100 == 0:
-            output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
-                                      args.name)
-            if not os.path.exists(output_dir): os.makedirs(output_dir)
-            pd.DataFrame(records).to_csv(os.path.join(output_dir, f"{epoch_idx}.csv"), index=False)
+            pd.DataFrame(records).to_csv(output_file,
+                                         mode='a', header=not os.path.exists(output_file),
+                                         index=False)
+            records = []
 
     return total_loss
 
