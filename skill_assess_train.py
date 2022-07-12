@@ -4,17 +4,15 @@ import time
 import copy
 import pickle
 import os
+import json
 
 import numpy as np
-from scipy import stats
 import dgl
 import torch
-import torch.nn.functional as F
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from allrank.models import losses
-from torchmetrics.functional import spearman_corrcoef
 
 from model.tgn import TGN
 from utils.dataloading import (FastTemporalEdgeCollator, FastTemporalSampler,
@@ -31,7 +29,7 @@ np.random.seed(2021)
 torch.manual_seed(2021)
 
 
-def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
+def train(model, dataloader, optimizer, args, criterion, epoch_idx, output_dir):
     model.train()
     total_loss = 0
     batch_cnt = 0
@@ -41,8 +39,6 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
     records = []
     cumulative_loss = 0
 
-    output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
-                              args.name)
     output_file = os.path.join(output_dir, f"{epoch_idx}.csv")
     if not os.path.exists(output_dir): os.makedirs(output_dir)
     if os.path.exists(output_file):  os.remove(output_file)
@@ -57,61 +53,20 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
         if pair_g.num_edges('played_by') <= 1:
             continue
 
-        # protection against cases in which a single player has more than a single match to the same edge
-        if pair_g.num_nodes('player') != pair_g.num_edges('played_by'):
-            # means that a player has two edges for the same match
-            seen_pid = []
-            delete_eid = []
-            u, v, e = pair_g.edges('all', etype='played_by')
-            for idx_match, idx_player, idx_edge in zip(u, v, e):
-                if idx_player in seen_pid:
-                    delete_eid.append(idx_edge)
-                else:
-                    seen_pid.append(idx_player)
-            delete_eid = torch.stack(delete_eid)
+        loss, metrics_all, known_nodes, known_loss, metrics_known = process_batch(input_nodes,
+                                                                                  pair_g,
+                                                                                  blocks,
+                                                                                  dataloader,
+                                                                                  model,
+                                                                                  criterion)
 
-            if len(delete_eid) >= 1:
-                pair_g.remove_edges(delete_eid, 'played_by')
-
-        source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks,
-                                                                   complete_graph=dataloader.collator.g_sampling)
-        known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
-        _, dstnodes = pair_g.edges(etype='played_by')
-        p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
-        known_edges = model.memory.last_update[p_nid] > 0
-
-        dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
-
-        # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
-        predicted_scores = dummy_pred.unsqueeze(0)
-        true_relevance = pair_g.edata['result'][('match', 'played_by', 'player')].unsqueeze(0)
-
-        # loss = +losses.listMLE(predicted_scores, true_relevance)
-        loss = losses.rankNet(predicted_scores, true_relevance)
-
-        metrics_all = metrics.calc_metrics(preds=predicted_scores.squeeze(0).detach().cpu().numpy(),
-                                           targets=true_relevance.squeeze(0).detach().cpu().numpy())
-
-        if known_nodes > 1:
-            targets = true_relevance[:, known_edges]
-
-            pred_known = torch.squeeze(model.dummy_lin(source_node_embeddings[known_edges])).unsqueeze(0)
-
-            metrics_known = metrics.calc_metrics(preds=pred_known.squeeze(0).detach().cpu().numpy(),
-                                                 targets=targets.squeeze(0).detach().cpu().numpy())
-
-            # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
-            known_loss = losses.rankNet(pred_known, targets)
-            # known_loss = +losses.marginRankNet(pred_known, targets)
-
+        # accumulate the loss according to the configuration
+        if not args.opt_known:
+            cumulative_loss += loss
+        elif known_loss is not None:
             cumulative_loss += known_loss
 
-        else:
-            pass
-            # cumulative_loss += loss  # TODO: commented out temporarily
-
         # loss = criterion(dummy_pred, pair_g.edata['result'][('match', 'played_by', 'player')])
-        total_loss += float(loss) * args.batch_size
         retain_graph = True if batch_cnt == 0 and not args.fast_mode else False
 
         d = {'Batch': batch_cnt,
@@ -120,13 +75,13 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
              'numKnown': known_nodes.item(),
              }
         d.update(metrics_all)
-        print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
-        print(print_str)
+        # print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
+        # print(print_str)
 
         if known_nodes > 1:
             dict_addition = {'knownLoss': known_loss.item()}
             dict_addition.update({f"known_{k}": v for k, v in metrics_known.items()})
-            print(' , '.join(f"{k} : {v:0.3f}" for k, v in dict_addition.items()))
+            # print(' , '.join(f"{k} : {v:0.3f}" for k, v in dict_addition.items()))
             d.update(dict_addition)
         else:
             d.update({'knownLoss': np.nan})
@@ -146,38 +101,135 @@ def train(model, dataloader, sampler, criterion, optimizer, args, epoch_idx):
             model.memory.detach_memory()
 
         if batch_cnt % 100 == 0:
+            print(f"Batch: {batch_cnt}")
             pd.DataFrame(records).to_csv(output_file,
                                          mode='a', header=not os.path.exists(output_file),
                                          index=False)
             records = []
 
-    return total_loss
+
+def process_batch(input_nodes,
+                  pair_g,
+                  blocks,
+                  dataloader,
+                  model,
+                  criterion):
+    # protection against cases in which a single player has more than a single match to the same edge
+    if pair_g.num_nodes('player') != pair_g.num_edges('played_by'):
+        # means that a player has two edges for the same match
+        seen_pid = []
+        delete_eid = []
+        u, v, e = pair_g.edges('all', etype='played_by')
+        for idx_match, idx_player, idx_edge in zip(u, v, e):
+            if idx_player in seen_pid:
+                delete_eid.append(idx_edge)
+            else:
+                seen_pid.append(idx_player)
+        delete_eid = torch.stack(delete_eid)
+
+        if len(delete_eid) >= 1:
+            pair_g.remove_edges(delete_eid, 'played_by')
+
+    # get embedding for the source nodes in the subgraph of interest
+    source_node_embeddings = model.compute_temporal_embeddings(input_nodes, pair_g, blocks,
+                                                               complete_graph=dataloader.collator.g_sampling)
+
+    # how many nodes in the subgraph were "seen" before and are known to the model
+    known_nodes = (model.memory.last_update[pair_g.nodes['player'].data[dgl.NID]] > 0).sum()
+    # which of the nodes are the ones that are known
+    _, dstnodes = pair_g.edges(etype='played_by')
+    p_nid = pair_g.nodes['player'].data[dgl.NID][dstnodes]
+    known_edges = model.memory.last_update[p_nid] > 0
+
+    # project the acquired embedding for getting the output score
+    dummy_pred = torch.squeeze(model.dummy_lin(source_node_embeddings))
+    # pred_pos, pred_neg = model.embed(input_nodes, pair_g, blocks)
+
+    predicted_scores = dummy_pred.unsqueeze(0)
+    # acquire the true target values for the nodes involved in the subgraph of interest
+    true_relevance = pair_g.edata['result'][('match', 'played_by', 'player')].unsqueeze(0)
+    # loss = +losses.listMLE(predicted_scores, true_relevance)
+    # compute loss and metrics
+    loss = criterion(predicted_scores, true_relevance)
+    metrics_all = metrics.calc_metrics(preds=predicted_scores.squeeze(0).detach().cpu().numpy(),
+                                       targets=true_relevance.squeeze(0).detach().cpu().numpy())
+
+    # we also compute the loss and the metrics for the known nodes separately
+    if known_nodes > 1:
+        targets = true_relevance[:, known_edges]
+
+        pred_known = torch.squeeze(model.dummy_lin(source_node_embeddings[known_edges])).unsqueeze(0)
+
+        metrics_known = metrics.calc_metrics(preds=pred_known.squeeze(0).detach().cpu().numpy(),
+                                             targets=targets.squeeze(0).detach().cpu().numpy())
+
+        # known_loss = +losses.listMLE(predicted_scores[:, known_edges], true_relevance[:, known_edges])
+        known_loss = criterion(pred_known, targets)
+        # known_loss = +losses.marginRankNet(pred_known, targets)
+
+        # cumulative_loss += known_loss
+    else:
+        known_loss, metrics_known = None, None
+
+    return loss, metrics_all, known_nodes, known_loss, metrics_known
 
 
-def test_val(model, dataloader, sampler, criterion, args):
+def test_val(model, dataloader, criterion, args, epoch_idx, output_dir):
     model.eval()
-    batch_size = args.batch_size
-    total_loss = 0
-    aps, aucs = [], []
+
+    output_file = os.path.join(output_dir, f"{epoch_idx}.csv")
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    if os.path.exists(output_file):  os.remove(output_file)
+
+    # will be used to aggregate batch results and metrics
+    records = []
     batch_cnt = 0
+    last_t = time.time()
+
     with torch.no_grad():
-        for _, postive_pair_g, negative_pair_g, blocks in dataloader:
-            pred_pos, pred_neg = model.embed(
-                postive_pair_g, negative_pair_g, blocks)
-            loss = criterion(pred_pos, torch.ones_like(pred_pos))
-            loss += criterion(pred_neg, torch.zeros_like(pred_neg))
-            total_loss += float(loss) * batch_size
-            y_pred = torch.cat([pred_pos, pred_neg], dim=0).sigmoid().cpu()
-            y_true = torch.cat(
-                [torch.ones(pred_pos.size(0)), torch.zeros(pred_neg.size(0))], dim=0)
-            if not args.not_use_memory:
-                model.update_memory(postive_pair_g)
-            if args.fast_mode:
-                sampler.attach_last_update(model.memory.last_update_t)
-            aps.append(average_precision_score(y_true, y_pred))
-            aucs.append(roc_auc_score(y_true, y_pred))
+
+        for input_nodes, pair_g, blocks in dataloader:
+            pair_g = pair_g.to(model.device)
+
+            # protection - in case there's only a single edge in the subgraph
+            if pair_g.num_edges('played_by') <= 1:
+                continue
+
+            loss, metrics_all, known_nodes, known_loss, metrics_known = process_batch(input_nodes,
+                                                                                      pair_g,
+                                                                                      blocks,
+                                                                                      dataloader,
+                                                                                      model,
+                                                                                      criterion)
+
+            d = {'Batch': batch_cnt,
+                 'Time': time.time() - last_t,
+                 'OverallLoss': loss.item(),
+                 'numKnown': known_nodes.item(),
+                 }
+            d.update(metrics_all)
+            # print_str = ' , '.join(f"{k} : {v:0.3f}" for k, v in d.items())
+            # print(print_str)
+
+            if known_nodes > 1:
+                dict_addition = {'knownLoss': known_loss.item()}
+                dict_addition.update({f"known_{k}": v for k, v in metrics_known.items()})
+                # print(' , '.join(f"{k} : {v:0.3f}" for k, v in dict_addition.items()))
+                d.update(dict_addition)
+            else:
+                d.update({'knownLoss': np.nan})
+
+            records.append(d)
+
+            last_t = time.time()
             batch_cnt += 1
-    return float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
+
+            if batch_cnt % 100 == 0:
+                print(f"Validation Batch: {batch_cnt}")
+                pd.DataFrame(records).to_csv(output_file,
+                                             mode='a', header=not os.path.exists(output_file),
+                                             index=False)
+                records = []
 
 
 def decompose_batches(group_indicator):
@@ -249,9 +301,16 @@ if __name__ == "__main__":
                         help='Whether to use the embedding of the source node as part of the message')
     parser.add_argument('--backprop_every', type=int, default=1, help='Every how many batches to '
                                                                       'backprop')
+    parser.add_argument('--opt_known', action="store_true", default=False,
+                        help="Optimizes the model according to known nodes only")
 
     args = parser.parse_args()
     print(args)
+
+    output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg', args.name)
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    with open(os.path.join(output_dir, 'cli_args.json'), 'w') as f:
+        json.dump(args.__dict__, f, indent=2)
 
     assert not (
             args.fast_mode and args.simple_mode), "you can only choose one sampling mode"
@@ -448,10 +507,11 @@ if __name__ == "__main__":
     valid_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=valid_seed,
                                               graph_sampler=sampler,
-                                              batch_size=args.batch_size,
+                                              batch_sampler=valid_batch_sampler,
+                                              # batch_size=args.batch_size,
                                               negative_sampler=None,
-                                              shuffle=False,
-                                              drop_last=False,
+                                              # shuffle=False,
+                                              # drop_last=False,
                                               num_workers=0,
                                               collator=edge_collator,
                                               # g_sampling=g_sampling,
@@ -461,10 +521,11 @@ if __name__ == "__main__":
     test_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                              eids=test_seed,
                                              graph_sampler=sampler,
-                                             batch_size=args.batch_size,
+                                             batch_sampler=test_batch_sampler,
+                                             # batch_size=args.batch_size,
                                              negative_sampler=None,
-                                             shuffle=False,
-                                             drop_last=False,
+                                             # shuffle=False,
+                                             # drop_last=False,
                                              num_workers=0,
                                              collator=edge_collator,
                                              # g_sampling=g_sampling,
@@ -521,8 +582,9 @@ if __name__ == "__main__":
                 use_source_embedding_in_message=args.use_source_embedding_in_message,
                 )
 
-    criterion = torch.nn.L1Loss()  # Should be changed to informational loss
+    criterion = losses.rankNet
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+
     # Implement Logging mechanism
     f = open("logging.txt", 'w')
     if args.fast_mode:
@@ -531,11 +593,13 @@ if __name__ == "__main__":
         for i in range(args.epochs):
             model.memory.__init_memory__()
 
-            train_loss = train(model, train_dataloader, sampler,
-                               criterion, optimizer, args, epoch_idx=i)
+            train(model, train_dataloader, optimizer, args, criterion, epoch_idx=i, output_dir=output_dir)
 
-            val_ap, val_auc = test_val(
-                model, valid_dataloader, sampler, criterion, args)
+            test_val(model, valid_dataloader, criterion, args, epoch_idx=i,
+                     output_dir=os.path.join(output_dir, 'validation'))
+
+            continue  # TODO: right now running only for validation
+
             memory_checkpoint = model.store_memory()
             if args.fast_mode:
                 new_node_sampler.sync(sampler)
