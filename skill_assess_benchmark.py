@@ -5,15 +5,15 @@ import time
 import copy
 import pickle
 import os
+import json
 import numpy as np
+import cloudpickle
 from scipy import stats
 import dgl
 import torch
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
-from allrank.models import losses
 from model import benchmarks
-from model.tgn import TGN
 from utils.dataloading import (FastTemporalEdgeCollator, FastTemporalSampler,
                                SimpleTemporalEdgeCollator, SimpleTemporalSampler,
                                TemporalEdgeDataLoader, TemporalSampler, TemporalEdgeCollator)
@@ -28,8 +28,8 @@ np.random.seed(2021)
 torch.manual_seed(2021)
 
 
-def apply_skil_methods(methods: Dict[str, benchmarks.AbstractSkillMethod], dataloader, sampler, args, epoch_idx):
-    total_loss = 0
+def apply_skil_methods(methods: Dict[str, benchmarks.AbstractSkillMethod], dataloader, args, epoch_idx, experiment_dir,
+                       is_validation=False):
     batch_cnt = 0
     last_t = time.time()
 
@@ -38,11 +38,8 @@ def apply_skil_methods(methods: Dict[str, benchmarks.AbstractSkillMethod], datal
     for k in methods.keys():
         records[k] = []
 
-    cumulative_loss = 0
-
     for method_name in methods:
-        output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
-                                  args.name, method_name)
+        output_dir = os.path.join(experiment_dir, method_name)
         output_file = os.path.join(output_dir, f"{epoch_idx}.csv")
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         if os.path.exists(output_file):  os.remove(output_file)
@@ -111,17 +108,17 @@ def apply_skil_methods(methods: Dict[str, benchmarks.AbstractSkillMethod], datal
         batch_cnt += 1
 
         if batch_cnt % 100 == 0:
-            print(f"Batch: {batch_cnt}")
+            pfx = 'Validation' if is_validation else ''
+            print(pfx + f"Batch: {batch_cnt}")
             for method_name in methods:
-                output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg',
-                                          args.name, method_name)
+                output_dir = os.path.join(experiment_dir, method_name)
                 output_file = os.path.join(output_dir, f"{epoch_idx}.csv")
                 pd.DataFrame(records[method_name]).to_csv(output_file,
                                                           mode='a', header=not os.path.exists(output_file),
                                                           index=False)
                 records[method_name] = []  # clean
 
-    return None
+    return methods
 
 
 def test_val(model, dataloader, sampler, criterion, args):
@@ -222,6 +219,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     print(args)
+
+    output_dir = os.path.join('/mnt/DS_SHARED/users/dvirb/experiments/research/skill/graphs/pubg', args.name)
+    if not os.path.exists(output_dir): os.makedirs(output_dir)
+    with open(os.path.join(output_dir, 'cli_args.json'), 'w') as f:
+        json.dump(args.__dict__, f, indent=2)
 
     assert not (
             args.fast_mode and args.simple_mode), "you can only choose one sampling mode"
@@ -418,10 +420,11 @@ if __name__ == "__main__":
     valid_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=valid_seed,
                                               graph_sampler=sampler,
-                                              batch_size=args.batch_size,
+                                              batch_sampler=valid_batch_sampler,
+                                              # batch_size=args.batch_size,
                                               negative_sampler=None,
-                                              shuffle=False,
-                                              drop_last=False,
+                                              # shuffle=False,
+                                              # drop_last=False,
                                               num_workers=0,
                                               collator=edge_collator,
                                               # g_sampling=g_sampling,
@@ -431,10 +434,11 @@ if __name__ == "__main__":
     test_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                              eids=test_seed,
                                              graph_sampler=sampler,
-                                             batch_size=args.batch_size,
+                                             batch_sampler=test_batch_sampler,
+                                             # batch_size=args.batch_size,
                                              negative_sampler=None,
-                                             shuffle=False,
-                                             drop_last=False,
+                                             # shuffle=False,
+                                             # drop_last=False,
                                              num_workers=0,
                                              collator=edge_collator,
                                              # g_sampling=g_sampling,
@@ -482,13 +486,19 @@ if __name__ == "__main__":
 
     try:
         for i in range(args.epochs):
-            train_loss = apply_skil_methods(methods, train_dataloader, sampler,
-                                            args, epoch_idx=i)
+            methods = apply_skil_methods(methods, train_dataloader, args, epoch_idx=i, experiment_dir=output_dir)
+
+            # with open(os.path.join(output_dir, 'post_training.pkl'), 'wb') as f:
+            #     cloudpickle.dump(methods, f)
+
+            methods = apply_skil_methods(methods, valid_dataloader, args, epoch_idx=i,
+                                         experiment_dir=os.path.join(output_dir, 'validation'),
+                                         is_validation=True)
+
+            # with open(os.path.join(output_dir, 'post_validation.pkl'), 'wb') as f:
+            #     cloudpickle.dump(methods, f)
 
             exit(0)  # TODO: get rid of
-
-            val_ap, val_auc = test_val(
-                model, valid_dataloader, sampler, criterion, args)
             memory_checkpoint = model.store_memory()
             if args.fast_mode:
                 new_node_sampler.sync(sampler)
