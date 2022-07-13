@@ -323,23 +323,35 @@ if __name__ == "__main__":
     device = torch.device(device_string)
 
     data_path = os.path.normpath('/mnt/DS_SHARED/users/dvirb/data/research/graphs/games/pubg')
+
+    print('Loading metadata file (if exists)')
+    t_start = time.time()
     meta_file = os.path.join(data_path, 'complete_meta.pickle')
     if os.path.exists(meta_file):
         with open(meta_file, 'rb') as handle:
             loaded_meta = pickle.load(handle)
     else:
         loaded_meta = None
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
+    print('Loading graph object from disk')
+    t_start = time.time()
     gs, _ = dgl.load_graphs(os.path.join(data_path, 'complete_ffa.bin'))
     data = gs[0]
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # reverse the edges
+    print('Reversing edges to form the opposite relation (including edge data)')
+    t_start = time.time()
     rel = data.edge_type_subgraph([('player', 'plays', 'match')])
     reverse_rel = dgl.reverse(rel, copy_edata=True)
     reversed_edges = reverse_rel.all_edges()
     data.add_edges(*reversed_edges, data=reverse_rel.edata, etype=('match', 'played_by', 'player'))
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # Pre-process data, mask new node in test set from original graph
+    print('Counting nodes and verifying order')
+    t_start = time.time()
     num_nodes = data.num_nodes()
     num_edges = data.num_edges(etype='plays')
 
@@ -350,9 +362,12 @@ if __name__ == "__main__":
     assert torch.all(torch.diff(data.edges['plays'].data['timestamp']) >= 0)
     src_id, dst_id, edge_id = data.edges('all', etype='plays')
     assert torch.all(torch.diff(dst_id) >= 0)
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # set split according to preset fraction
     # =======================================
+    print('Determining subset splits')
+    t_start = time.time()
 
     # train
     train_div = int(TRAIN_SPLIT * num_edges)
@@ -375,7 +390,10 @@ if __name__ == "__main__":
 
     test_new_nodes = {
         'player': np.random.choice(test_nodes['player'], int(0.1 * len(test_nodes['player'])), replace=False)}
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
+    print(f"Creating a subgraph excluding the new-unseen nodes")
+    t_start = time.time()
     in_subg = dgl.in_subgraph(data, test_new_nodes)
     out_subg = dgl.out_subgraph(data, test_new_nodes)
     # Remove edge who happen before the test set to prevent from learning the connection info
@@ -409,10 +427,13 @@ if __name__ == "__main__":
     graph_no_new_node = copy.deepcopy(data)
     for etype, eid in eid_delete.items():
         graph_no_new_node.remove_edges(eid, etype)
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # graph_no_new_node and graph_new_node should have same set of nid
 
     # Sampler Initialization
+    print(f"Initializing Sampler")
+    t_start = time.time()
     if args.simple_mode:
         fan_out = [args.n_neighbors for _ in range(args.k_hop)]
         sampler = SimpleTemporalSampler(graph_no_new_node, fan_out)
@@ -425,8 +446,11 @@ if __name__ == "__main__":
     else:
         sampler = TemporalSampler(k=args.n_neighbors, hops=args.k_hop)
         edge_collator = TemporalEdgeCollator
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # Set Train, validation, test and new node test id
+    print(f"Creating boolean arrays indicating the subset-association of edges")
+    t_start = time.time()
     train_bool = {etype: graph_no_new_node.edges[etype].data['timestamp'] <= train_last_ts for etype in
                   data.canonical_etypes}
     valid_bool = {etype: torch.logical_and(graph_no_new_node.edges[etype].data['timestamp'] > train_last_ts,
@@ -435,7 +459,10 @@ if __name__ == "__main__":
     test_bool = {etype: graph_no_new_node.edges[etype].data['timestamp'] > div_time for etype in data.canonical_etypes}
     test_new_node_bool = {etype: graph_new_node.edges[etype].data['timestamp'] > div_time for etype in
                           data.canonical_etypes}
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
+    print(f"Creating subset-specific seeds and setting batch samplers")
+    t_start = time.time()
     train_seed, valid_seed, test_seed, test_new_node_seed = dict(), dict(), dict(), dict()
     for etype in data.canonical_etypes:  # get eids
         # instead of iterating over etypes, only a single etype is required
@@ -470,19 +497,26 @@ if __name__ == "__main__":
         # we don't need really need to consider the reverse edges (for the mirror etype) as seeds.
         # Hence - break # TODO: consider what to do with it when teams are involved
         break
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # Compute time statistics
+    print(f"Computing (or loading from pre-computed meta) the time-statistics")
+    t_start = time.time()
     if loaded_meta is None:
         mean_time_shift, std_time_shift = compute_time_statistics(data, edge_type=('player', 'plays', 'match'))
     else:
         mean_time_shift, std_time_shift = loaded_meta['mean_time_shift'], loaded_meta['std_time_shift']
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
+    print(f"Assinging node ids to graphs")
+    t_start = time.time()
     g_sampling = None if args.fast_mode else graph_no_new_node
     new_node_g_sampling = None if args.fast_mode else graph_new_node
     if not args.fast_mode:
         for ntype in data.ntypes:
             new_node_g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
             g_sampling.nodes[ntype].data[dgl.NID] = new_node_g_sampling.nodes(ntype)
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # we highly recommend that you always set the num_workers=0, otherwise the sampled subgraph may not be correct.
     reverse_etypes = {
@@ -490,6 +524,8 @@ if __name__ == "__main__":
         ('match', 'played_by', 'player'): ('player', 'plays', 'match')
     }
 
+    print(f"Initializing data loaders")
+    t_start = time.time()
     train_dataloader = TemporalEdgeDataLoader(g=graph_no_new_node,
                                               eids=train_seed,
                                               graph_sampler=sampler,
@@ -544,6 +580,7 @@ if __name__ == "__main__":
                                                       # g_sampling=new_node_g_sampling,
                                                       exclude='reverse_types',
                                                       reverse_etypes=reverse_etypes)
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     etypes = data.canonical_etypes
     assert data.edata['feats'][etypes[0]].shape[1] == data.edata['feats'][etypes[1]].shape[1]
@@ -562,6 +599,8 @@ if __name__ == "__main__":
                 handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     # Initialize Model
+    print(f"Initializing model and optimizer")
+    t_start = time.time()
     model = TGN(n_edge_features=edge_dim,
                 n_node_features=0,
                 n_nodes=num_lasting_nodes,
@@ -584,6 +623,7 @@ if __name__ == "__main__":
 
     criterion = losses.rankNet
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
     # Implement Logging mechanism
     f = open("logging.txt", 'w')
@@ -591,10 +631,23 @@ if __name__ == "__main__":
         sampler.reset()
     try:
         for i in range(args.epochs):
-            model.memory.__init_memory__()
+            print('=' * 50)
+            print(f"Starting epoch no. {i}")
+            print('=' * 50)
 
+            print(f"Initializing memory")
+            t_start = time.time()
+            model.memory.__init_memory__()
+            print(f"Endured {(time.time() - t_start):.3f} Seconds")
+
+            print('=' * 50)
+            print(f"Starting training for epoch no. {i}")
+            print('=' * 50)
             train(model, train_dataloader, optimizer, args, criterion, epoch_idx=i, output_dir=output_dir)
 
+            print('=' * 50)
+            print(f"Starting validation for epoch no. {i}")
+            print('=' * 50)
             test_val(model, valid_dataloader, criterion, args, epoch_idx=i,
                      output_dir=os.path.join(output_dir, 'validation'))
 
