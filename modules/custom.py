@@ -1,4 +1,5 @@
 import math
+from typing import MutableMapping
 import dgl
 import dgl.nn.pytorch as dglnn
 import dgl.function as fn
@@ -113,9 +114,9 @@ class EdgeUpdatingHeteroGraphConv(dglnn.HeteroGraphConv):
                 outputs[dtype].append(dstdata)
         else:
             for stype, etype, dtype in g.canonical_etypes:
-                rel_graph = g[stype, etype, dtype]
-                if stype not in inputs:
+                if stype not in inputs or etype not in self.mods:
                     continue
+                rel_graph = g[stype, etype, dtype]
                 dstdata, edge_data = self.mods[etype](
                     rel_graph,
                     (inputs[stype], inputs[dtype]),
@@ -130,53 +131,100 @@ class EdgeUpdatingHeteroGraphConv(dglnn.HeteroGraphConv):
         return rsts, edge_outputs
 
 
-class TwoLayerHeteroGraphConv(nn.Module):
-    def __init__(self, player_dim, match_dim, edge_dim, activation, hidden_dim, out_dim):
-        super(TwoLayerHeteroGraphConv, self).__init__()
-        self.conv1 = EdgeUpdatingHeteroGraphConv({
-            'plays': GNNLayer(source_dim=player_dim,
-                              dest_dim=match_dim,
-                              edge_dim=edge_dim,
-                              activation=activation,
-                              hidden_dim=hidden_dim,
-                              ndim_out=hidden_dim,
-                              edim_out=hidden_dim,
-                              ignore_dstdata=match_dim == 0,
-                              ignore_srcdata=player_dim == 0),
-            'played_by': GNNLayer(source_dim=match_dim,
-                                  dest_dim=player_dim,
-                                  edge_dim=edge_dim,
-                                  activation=activation,
-                                  hidden_dim=hidden_dim,
-                                  ndim_out=hidden_dim,
-                                  edim_out=hidden_dim,
-                                  ignore_srcdata=match_dim == 0,
-                                  ignore_dstdata=player_dim == 0)},
+class CompleteCycleGraphConv(nn.Module):
+    def __init__(self, player_dim, team_dim, match_dim, member_dim, competes_dim, activation, hidden_dim, out_dim,
+                 etype_mirrors: MutableMapping = None):
+        super(CompleteCycleGraphConv, self).__init__()
+
+        self.etype_mirrors = etype_mirrors
+        if etype_mirrors is not None:
+            self.etype_mirrors.update({v: k for k, v in self.etype_mirrors.items()})
+
+        self.module_list = nn.ModuleList()
+
+        self.player_to_team = EdgeUpdatingHeteroGraphConv({
+            'member': GNNLayer(source_dim=player_dim,
+                               dest_dim=team_dim,
+                               edge_dim=member_dim,
+                               activation=activation,
+                               hidden_dim=out_dim * 5,
+                               ndim_out=out_dim * 10,
+                               edim_out=out_dim * 5,
+                               reduce_fn=fn.mean,
+                               ignore_dstdata=team_dim == 0,
+                               ignore_srcdata=player_dim == 0)},
             aggregate='sum')
 
-        self.conv2 = EdgeUpdatingHeteroGraphConv({
-            'plays': GNNLayer(source_dim=hidden_dim,
-                              dest_dim=hidden_dim,
-                              edge_dim=hidden_dim,
-                              activation=activation,
-                              hidden_dim=hidden_dim,
-                              ndim_out=out_dim,
-                              edim_out=out_dim),
-            'played_by': GNNLayer(source_dim=hidden_dim,
-                                  dest_dim=hidden_dim,
-                                  edge_dim=hidden_dim,
-                                  activation=activation,
-                                  hidden_dim=hidden_dim,
-                                  ndim_out=out_dim,
-                                  edim_out=out_dim)},
+        self.team_to_match = EdgeUpdatingHeteroGraphConv({
+            'competes': GNNLayer(source_dim=out_dim * 10,
+                                 dest_dim=match_dim,
+                                 edge_dim=competes_dim,
+                                 activation=activation,
+                                 hidden_dim=out_dim * 5,
+                                 ndim_out=out_dim * 10,
+                                 edim_out=out_dim * 5,
+                                 reduce_fn=fn.mean,
+                                 ignore_dstdata=match_dim == 0,
+                                 ignore_srcdata=False)},
             aggregate='sum')
+
+        self.match_to_team = EdgeUpdatingHeteroGraphConv({
+            'played_by': GNNLayer(source_dim=out_dim * 10,
+                                  dest_dim=out_dim * 10,
+                                  edge_dim=out_dim * 5,
+                                  activation=activation,
+                                  hidden_dim=out_dim * 5,
+                                  ndim_out=out_dim * 10,
+                                  edim_out=out_dim * 5,
+                                  reduce_fn=fn.mean,
+                                  ignore_dstdata=False,
+                                  ignore_srcdata=False)},
+            aggregate='sum')
+
+        self.team_to_player = EdgeUpdatingHeteroGraphConv({
+            'contains': GNNLayer(source_dim=out_dim * 10,
+                                 dest_dim=player_dim,
+                                 edge_dim=out_dim * 5,
+                                 activation=activation,
+                                 hidden_dim=out_dim * 5,
+                                 ndim_out=out_dim,
+                                 edim_out=out_dim,
+                                 reduce_fn=fn.mean,
+                                 ignore_dstdata=False,
+                                 ignore_srcdata=False)},
+            aggregate='sum')
+
+        self.module_list.append(self.player_to_team)
+        self.module_list.append(self.team_to_match)
+        self.module_list.append(self.match_to_team)
+        self.module_list.append(self.team_to_player)
+
+        self.num_modules = len(self.module_list)
+
+    def update_embeddings(self, node_inputs, edge_inputs, new_node_inputs, new_edge_inputs):
+        for node_type, node_embeddings in new_node_inputs.items():
+            if node_embeddings.numel():
+                node_inputs[node_type] = node_embeddings
+
+        for edge_type, edge_embeddings in new_edge_inputs.items():
+            if len(edge_embeddings):
+                edge_inputs[edge_type]['efeats'] = edge_embeddings
+                if self.etype_mirrors is not None and edge_type in self.etype_mirrors:
+                    edge_inputs[self.etype_mirrors[edge_type]]['efeats'] = edge_embeddings
+
+        return node_inputs, edge_inputs
 
     def forward(self, g, node_inputs, edge_feats):
-        nfeats, efeats = self.conv1(g, inputs=node_inputs,
-                                    mod_kwargs={k: {'efeats': v} for k, v in edge_feats.items()})
-        nouts, eouts = self.conv2(g, inputs=nfeats, mod_kwargs={k: {'efeats': v} for k, v in efeats.items()})
+        edge_feats = {k: {'efeats': v} for k, v in edge_feats.items()}
 
-        return nouts, eouts
+        for i, module in enumerate(self.module_list):
+            nfeats, efeats = module(g, inputs=node_inputs, mod_kwargs=edge_feats)
+            if i < self.num_modules - 1:
+                node_inputs, edge_feats = self.update_embeddings(node_inputs, edge_feats,
+                                                                 new_node_inputs=nfeats,
+                                                                 new_edge_inputs=efeats)
+
+        return nfeats, efeats
 
 
 class LayerNormGRUCell(torch.nn.Module):
