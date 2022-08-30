@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import dgl
 
+from utils.misc import flip_edges, validate_subgraph
 from utils.utils import MergeLayer
 from modules.memory import Memory
 from modules.message_aggregator import get_message_aggregator
@@ -12,7 +13,7 @@ from modules.message_function import get_message_function
 from modules.memory_updater import get_memory_updater
 from modules.embedding_module import get_embedding_module
 from model.time_encoding import TimeEncode
-from modules.custom import EdgeUpdatingHeteroGraphConv, GNNLayer, TwoLayerHeteroGraphConv
+from modules.custom import EdgeUpdatingHeteroGraphConv, GNNLayer, CompleteCycleGraphConv
 
 
 class TGN(torch.nn.Module):
@@ -34,12 +35,19 @@ class TGN(torch.nn.Module):
                  aggregator_type="last",
                  memory_updater_type="gru",
                  use_destination_embedding_in_message=False,
-                 use_source_embedding_in_message=False):
+                 use_source_embedding_in_message=False,
+                 debug_mode=False):
         super(TGN, self).__init__()
 
         self.n_layers = n_layers
         self.device = device
+        self.debug = debug_mode
         self.logger = logging.getLogger(__name__)
+
+        self.membership_etypes = {'forward': ('player', 'member', 'team'),
+                                  'backwards': ('team', 'contains', 'player')}
+        self.opponents_etypes = {'forward': ('team', 'competes', 'match'),
+                                 'backwards': ('match', 'played_by', 'team')}
 
         self.n_edge_features = n_edge_features
         self.n_node_features = n_node_features
@@ -65,17 +73,23 @@ class TGN(torch.nn.Module):
                              memory_dimension=self.memory_dimension,
                              input_dimension=message_dimension,
                              message_dimension=message_dimension,
-                             device=device)
+                             device=device,
+                             debug_mode=debug_mode)
         self.message_aggregator = get_message_aggregator(aggregator_type=aggregator_type,
                                                          device=device)
 
-        self.raw_message_processor = TwoLayerHeteroGraphConv(player_dim=self.memory_dimension,
-                                                             match_dim=0,
-                                                             edge_dim=(
-                                                                              self.n_edge_features + 1) + self.time_encoder.dimension,
-                                                             activation=F.elu,
-                                                             hidden_dim=message_dimension,
-                                                             out_dim=message_dimension).to(self.device)
+        self.raw_message_processor = CompleteCycleGraphConv(player_dim=self.memory_dimension,
+                                                            team_dim=0,
+                                                            match_dim=0,
+
+                                                            member_dim=(
+                                                                               self.n_edge_features + 1) + self.time_encoder.dimension,
+                                                            competes_dim=1,
+                                                            activation=F.elu,
+                                                            hidden_dim=message_dimension,
+                                                            out_dim=message_dimension,
+                                                            etype_mirrors={'member': 'contains',
+                                                                           'competes': 'played_by'}).to(self.device)
 
         self.message_function = get_message_function(module_type=message_function,
                                                      raw_message_dimension=message_dimension,
@@ -86,15 +100,18 @@ class TGN(torch.nn.Module):
                                                  memory_dimension=self.memory_dimension,
                                                  device=device).to(self.device)
 
+        self.team_aggregator = dgl.nn.GATConv(in_feats=(memory_dimension, 1), out_feats=memory_dimension,
+                                              num_heads=1).to(self.device)
+        self.dummy_team_input = torch.zeros(1, 1, device=self.device)
+        self.team_matchup = torch.nn.MultiheadAttention(embed_dim=memory_dimension, num_heads=1,
+                                                        batch_first=True, add_bias_kv=True).to(self.device)
+
+        self.score_projector = torch.nn.Linear(self.memory_dimension, 1, device=self.device)
+
         # self.pre_attn_lin_q = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
         # self.pre_attn_lin_k = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
         # self.pre_attn_lin_v = torch.nn.Linear(memory_dimension, memory_dimension).to(self.device)
 
-        self.output_attn = torch.nn.MultiheadAttention(embed_dim=memory_dimension, num_heads=1,
-                                                       batch_first=True, add_bias_kv=True).to(self.device)
-
-        # TODO: lose it
-        self.dummy_lin = torch.nn.Linear(self.memory_dimension, 1, device=self.device)
         #
         # self.embedding_module = get_embedding_module(module_type=embedding_module_type,
         #                                              node_features=self.node_raw_features,
@@ -130,28 +147,23 @@ class TGN(torch.nn.Module):
         :return: Temporal embeddings for sources, destinations and negatives
         """
 
-        # which edge type? (assuming all edges in the batch are of the same type)
-        for etype in pair_graph.canonical_etypes:
-            if len(pair_graph.edata[dgl.EID][etype]) > 0:
-                break
-        # make sure only a single type of edges is available
-        assert sum([len(pair_graph.edata[dgl.EID][etype]) > 0 for etype in pair_graph.canonical_etypes]) == 1
+        # make sure only two edge types of edges is available
+        assert sum([len(pair_graph.edata[dgl.EID][etype]) > 0 for etype in pair_graph.canonical_etypes]) == 2
 
-        is_player_dst = etype[-1] == 'player'
         node_ids_p = pair_graph.nodes['player'].data[dgl.NID]  # only the player related nodes
         node_ids_m = pair_graph.nodes['match'].data[dgl.NID]  # only the match related nodes
 
-        edge_src, edge_dst = pair_graph.edges(etype=etype)
-        batch_player_node_ids = (node_ids_p[edge_dst] if is_player_dst else node_ids_p[edge_src]).cpu().numpy()
-        batch_match_node_ids = (node_ids_m[edge_src] if is_player_dst else node_ids_m[edge_dst]).cpu().numpy()
-        edge_times = pair_graph.edges[etype].data['timestamp']
+        m_edge_src, m_edge_dst = pair_graph.edges(etype='member')
+        c_edge_src, c_edge_dst = pair_graph.edges(etype='competes')
+        batch_player_node_ids = (node_ids_p[m_edge_src]).cpu().numpy()
+        batch_match_node_ids = (node_ids_m[c_edge_dst]).cpu().numpy()
+        edge_times = pair_graph.edges['member'].data['timestamp']
 
-        all_relevant_nodes = np.concatenate([input_nodes['player'].numpy(),
-                                             batch_player_node_ids])
+        assert torch.equal(pair_graph.nodes['player'].data[dgl.NID], node_ids_p[m_edge_src])
+        assert len(np.unique(batch_match_node_ids)) == 1 and len(torch.unique(edge_times)) == 1
 
         # Update memory for all nodes with messages stored in previous batches
-        memory, last_update, updated_nodes = self.update_and_get_memory(all_relevant_nodes,
-                                                                        batch_player_node_ids,
+        memory, last_update, updated_nodes = self.update_and_get_memory(batch_player_node_ids,
                                                                         complete_graph=complete_graph)
 
         ### Compute differences between the time the memory of a node was last updated,
@@ -173,24 +185,17 @@ class TGN(torch.nn.Module):
             negative_node_embedding = node_embedding[2 * n_samples:]
         else:
             out_node_embeddings = memory
-            out_node_embeddings[last_update == 0] = self.memory.default_memory
-
-        # Persist the updates to the memory only for sources and destinations (since now we have
-        # new messages for them) - This is now performed before
-        # self.update_memory(positives, self.memory.raw_messages_storage)
 
         # Remove messages for the positives since we have already updated the memory using them
         self.memory.clear_messages(updated_nodes)
+        # add to raw message storage the information about the nodes involved in the current batch
+        self.memory.store_uniform_raw_info(np.unique(batch_player_node_ids),
+                                           {
+                                               'ts': edge_times[0],
+                                               'match_nid': batch_match_node_ids[0]
+                                           })
 
-        raw_messages = self.get_raw_messages(pair_graph,
-                                             etype,
-                                             batch_player_node_ids,
-                                             batch_match_node_ids,
-                                             edge_times
-                                             )
-        self.memory.store_raw_messages(np.unique(batch_player_node_ids), raw_messages)
-
-        return out_node_embeddings
+        return out_node_embeddings, batch_player_node_ids
 
     def compute_edge_probabilities(self, source_nodes, destination_nodes, negative_nodes, edge_times,
                                    edge_idxs, n_neighbors=20):
@@ -229,44 +234,42 @@ class TGN(torch.nn.Module):
             unique_messages = self.message_function.compute_message(unique_messages)
 
         # Update the memory with the aggregated messages
-        self.memory_updater.update_memory(unique_nodes, unique_messages,
-                                          timestamps=unique_timestamps)
+        self.memory_updater.update_and_store_memory(unique_nodes, unique_messages,
+                                                    timestamps=unique_timestamps)
 
-    def update_and_get_memory(self, all_relevant_node_ids,
+    def update_and_get_memory(self,
                               out_node_ids,
                               complete_graph):
-        # Aggregate messages for the same nodes
-        nodes_to_update, raw_message_feats, message_timestamps, connector_node_id = \
+        # Figure out which nodes (out of the complete set of nodes of interest) require memory update computation
+        # if there are such - we acquire (using the raw memory storage) the corresponding matches ids (together with the
+        # relevant timestamps)
+        nodes_to_update, message_timestamps, connector_node_id = \
             self.message_aggregator.aggregate(
                 out_node_ids,
                 self.memory.raw_messages_storage)
 
+        # in case there are any nodes which require memory computation
         if len(nodes_to_update) > 0:
-
-            # TODO: verify this
-            # ==================
-            # sub_g = dgl.node_subgraph(complete_graph, {'match': connector_node_id})
-            affected_nodes, propagated_messages, messages_ts = self.recurse_message_computation(nodes_to_update,
-                                                                                                message_timestamps,
-                                                                                                connector_node_id,
-                                                                                                complete_graph)
-
-            # ==================
-
+            # in such case we need to compute the message according to which memory will be updated
+            affected_nodes, propagated_messages, messages_ts = self.acquire_all_messages(nodes_to_update,
+                                                                                         message_timestamps,
+                                                                                         connector_node_id,
+                                                                                         complete_graph)
+            # a subsequent processing (not graph dependent) of the acquired message representation
             processed_messages = self.message_function.compute_message(propagated_messages)
+
+            # Update the memory with the aggregated messages
+            self.memory_updater.update_and_store_memory(affected_nodes, processed_messages,
+                                                        timestamps=messages_ts)
         else:
             processed_messages = None
             affected_nodes = torch.empty(0)
             messages_ts = []
 
-        # Update the memory with the aggregated messages
-        self.memory_updater.update_memory(affected_nodes, processed_messages,
-                                          timestamps=messages_ts)
-
         return self.memory.get_memory(out_node_ids), self.memory.last_update[out_node_ids], affected_nodes.numpy()
 
-    def recurse_message_computation(self, induced_nodes, message_timestamps, connector_node_id, complete_graph):
-        # sort the incoming messages
+    def acquire_all_messages(self, induced_nodes, message_timestamps, connector_node_id, complete_graph):
+        # sort the incoming messages according to timestamps
         message_timestamps, indices = torch.sort(message_timestamps)
         indices = indices.cpu().numpy()
         induced_nodes = induced_nodes[indices]
@@ -275,117 +278,141 @@ class TGN(torch.nn.Module):
         # we need to iterate for each connector_node_id once
         connector_to_players = defaultdict(list)
         connector_to_ts = defaultdict(list)
+        # map each match to the corresponding relevant node ids and relevant timestamps
         for node_id, message_ts, conn_id in zip(induced_nodes, message_timestamps, connector_node_id):
             connector_to_players[conn_id].append(node_id)
             connector_to_ts[conn_id].append(message_ts.unsqueeze(0))
-
+        # make sure each connector is associated with a single unique ts
         for conn_id, conn_ts in connector_to_ts.items():
             connector_to_ts[conn_id] = torch.unique(torch.cat(conn_ts, 0))
-        # make sure each connector is associated with a single unique ts
         assert all([len(conn_ts) == 1 for _, conn_ts in connector_to_ts.items()])
 
+        # for each of the listed matches, aggregate all the affected nodes together with the computed messages and the
+        # corresponding timestamps
         all_affected_nodes = list()
         all_propagated_messages = list()
         propagated_messages_ts = list()
 
         for conn_id in connector_to_players:
-            connector_subgraph = dgl.in_subgraph(complete_graph, {'match': [conn_id]})
-            # remove all the unconnected (isolated) nodes - for getting the "pure" sub-graph:
-            connector_subgraph = dgl.remove_nodes(connector_subgraph, (
-                    connector_subgraph.in_degrees(etype='plays') == 0).nonzero().squeeze(), ntype='match')
-            connector_subgraph = dgl.remove_nodes(connector_subgraph, (
-                    connector_subgraph.out_degrees(etype='plays') == 0).nonzero().squeeze(), ntype='player')
+            affected_nodes, nodes_outputs, timestamps = self.get_messages_from_subgraph(complete_graph, conn_id,
+                                                                                        connector_to_players,
+                                                                                        connector_to_ts)
 
-            rel = connector_subgraph.edge_type_subgraph([('player', 'plays', 'match')])
-            reverse_rel = dgl.reverse(rel, copy_edata=True)
-            reversed_edges = reverse_rel.all_edges()
-            connector_subgraph.add_edges(*reversed_edges, data=reverse_rel.edata,
-                                         etype=('match', 'played_by', 'player'))
-
-            # verify player nodes are ordered similarly on both types of edges
-            assert torch.equal(connector_subgraph.edges(etype='plays')[0],
-                               connector_subgraph.edges(etype='played_by')[-1])
-
-            for type_of_edge in connector_subgraph.canonical_etypes:
-                if connector_subgraph.num_nodes('player') != connector_subgraph.num_edges(type_of_edge):
-                    # means that a player has two edges for the same match
-                    seen_pid = []
-                    delete_eid = []
-                    u, v, e = connector_subgraph.edges('all', etype=type_of_edge)
-
-                    is_player_dst = type_of_edge[-1] == 'player'
-
-                    for idx_u, idx_v, idx_edge in zip(u, v, e):
-                        idx_player = idx_v if is_player_dst else idx_u
-
-                        if idx_player in seen_pid:
-                            delete_eid.append(idx_edge)
-                        else:
-                            seen_pid.append(idx_player)
-                    delete_eid = torch.stack(delete_eid)
-
-                    if len(delete_eid) >= 1:
-                        connector_subgraph.remove_edges(delete_eid, type_of_edge)
-
-            affecting_nodes = connector_subgraph.nodes['player'].data[dgl.NID][
-                connector_subgraph.edges(etype='plays')[0]]
-
-            # make sure all to nodes we're interested in are vertices in the sliced subgraph
-            assert all([node_id in affecting_nodes for node_id in connector_to_players[conn_id]])
-
-            # Aggregate messages for the same nodes
-            nodes_to_update, raw_message_feats, timestamps, connectors = \
-                self.message_aggregator.aggregate(
-                    affecting_nodes.numpy(),
-                    self.memory.raw_messages_storage)
-            assert all(
-                connectors == conn_id), 'All the cached raw messages should be associated with the relevant node id'
-            assert all(timestamps == connector_to_ts[conn_id]), 'Same for timestamps'
-            assert all([nid in affecting_nodes for nid in nodes_to_update]) and len(affecting_nodes) == len(
-                nodes_to_update), 'They should point to the same nodes, otherwise this update should have been performed earlier'
-
-            connector_subgraph = connector_subgraph.to(self.device)
-
-            prev_memory = self.memory.get_memory(affecting_nodes)
-            last_t = self.memory.last_update[affecting_nodes]
-            prev_memory[last_t == 0] = self.memory.default_memory
-            time_diffs = timestamps - last_t
-            encoded_time = self.time_encoder(time_diffs.unsqueeze(1)).squeeze(1)
-            edge_feats = torch.cat([connector_subgraph.edges['plays'].data['feats'],
-                                    connector_subgraph.edges['plays'].data['result'].unsqueeze(1),
-                                    encoded_time], 1)
-
-            # the two edge-related subgraphs (two mods/relations) are not aligned in terms of edges
-            # that was previously the case - we might be able to remove this, when we're sure they are aligned
-            # ======================================================================================
-            # verify that edges are sorted on the first etype
-            src_nid = connector_subgraph.edges(etype='plays')[0].detach().cpu().numpy()
-            assert np.all(src_nid[:-1] < src_nid[1:])
-            dst_nid = connector_subgraph.edges(etype='played_by')[-1]
-            aligned_feats = edge_feats[dst_nid]
-
-            nfeats, efeats = self.raw_message_processor(connector_subgraph,
-                                                        node_inputs={
-                                                            'player': prev_memory,
-                                                            'match': torch.empty(connector_subgraph.num_nodes('match'),
-                                                                                 device=self.device)
-                                                        },
-                                                        edge_feats={
-                                                            'plays': edge_feats,
-                                                            'played_by': aligned_feats
-                                                        })
-
-            all_affected_nodes.append(affecting_nodes)
-            all_propagated_messages.append(nfeats['player'])
+            all_affected_nodes.append(affected_nodes)
+            all_propagated_messages.append(nodes_outputs['player'])
             propagated_messages_ts.append(timestamps)
 
         all_affected_nodes = torch.cat(all_affected_nodes, 0)
         all_propagated_messages = torch.cat(all_propagated_messages, 0)
         propagated_messages_ts = torch.cat(propagated_messages_ts, 0)
 
-        assert len(torch.unique(all_affected_nodes)) == len(all_affected_nodes)
+        assert len(torch.unique(all_affected_nodes)) == len(all_affected_nodes), \
+            "Every affected node should appear only once"
 
         return all_affected_nodes, all_propagated_messages, propagated_messages_ts
+
+    def get_messages_from_subgraph(self, complete_graph, conn_id, connector_to_players, connector_to_ts):
+        connector_subgraph = self.get_match_subgraph(complete_graph, conn_id)
+        connector_subgraph = self.validate_subgraph(connector_subgraph)
+        connector_subgraph = self.flip_subgraph_edges(connector_subgraph)
+
+        # which player nodes are relevant?
+        affecting_nodes = connector_subgraph.nodes['player'].data[dgl.NID]
+        # make sure all to nodes we're interested in (w.r.t to the specific match) are vertices in the sliced subgraph
+        assert all([node_id in affecting_nodes for node_id in connector_to_players[conn_id]])
+
+        self.verify_edge_order_alignment(connector_subgraph)
+        self.verify_raw_info_storage_alignment(affecting_nodes, conn_id, connector_to_ts[conn_id])
+        if self.debug:
+            # verify that edges are sorted on the first etype
+            src_nid = connector_subgraph.edges(etype='member')[0].detach().cpu().numpy()
+            assert np.all(src_nid[:-1] < src_nid[1:])
+
+        connector_subgraph = connector_subgraph.to(self.device)
+        prev_memory = self.memory.get_memory(affecting_nodes)
+
+        # encode time difference
+        cur_ts = connector_to_ts[conn_id].repeat(connector_subgraph.num_nodes('player'))  # same ts shared for all nodes
+        last_t = self.memory.last_update[affecting_nodes]  # last ts recorded (and used for memory update) - each node
+        time_diffs = connector_to_ts[conn_id] - last_t
+        encoded_time = self.time_encoder(time_diffs.unsqueeze(1)).squeeze(1)
+
+        # set the feature vector corresponding to each player-member-match edge and team-competes-match edge
+        member_efeats = torch.cat([connector_subgraph.edges['member'].data['feats'],
+                                   connector_subgraph.edges['member'].data['result'].unsqueeze(1),
+                                   encoded_time], 1)
+        competes_efeats = connector_subgraph.edges['competes'].data['result'].unsqueeze(1)
+
+        nodes_outputs, edges_outputs = self.raw_message_processor(connector_subgraph,
+                                                                  node_inputs={
+                                                                      'player': prev_memory,
+                                                                      'team': torch.empty(
+                                                                          connector_subgraph.num_nodes('team'), 0,
+                                                                          device=self.device),
+                                                                      'match': torch.empty(
+                                                                          connector_subgraph.num_nodes('match'),
+                                                                          0, device=self.device),
+                                                                  },
+                                                                  edge_feats={
+                                                                      'member': member_efeats,
+                                                                      'contains': member_efeats,
+                                                                      'competes': competes_efeats,
+                                                                      'played_by': competes_efeats,
+                                                                  })
+
+        return affecting_nodes, nodes_outputs, cur_ts
+
+    def verify_edge_order_alignment(self, connector_subgraph):
+        # verify that edges of opposite types are ordered identically
+        if self.debug:
+            assert torch.equal(connector_subgraph.edges(etype='member')[0],
+                               connector_subgraph.edges(etype='contains')[-1])
+            assert torch.equal(connector_subgraph.edges(etype='contains')[0],
+                               connector_subgraph.edges(etype='member')[-1])
+            assert torch.equal(connector_subgraph.edges(etype='competes')[0],
+                               connector_subgraph.edges(etype='played_by')[-1])
+
+    def verify_raw_info_storage_alignment(self, subgraph_nodes, conn_id, match_ts):
+        if not self.debug:
+            return
+
+        # fetch raw info from raw memory storage for all the subgraph player nodes
+        nodes_to_update, timestamps, connectors = \
+            self.message_aggregator.aggregate(
+                subgraph_nodes.numpy(),
+                self.memory.raw_messages_storage)
+        assert all(
+            connectors == conn_id), 'All the cached raw messages should be associated with the relevant match id'
+        assert all(
+            timestamps == match_ts), 'All the cached raw messages should be associated with the relevant timestamp'
+        assert all([nid in subgraph_nodes for nid in nodes_to_update]) and len(subgraph_nodes) == len(
+            nodes_to_update), 'They should point to the same nodes, otherwise this update should have been performed earlier'
+
+    def validate_subgraph(self, connector_subgraph):
+        if not self.debug:
+            return connector_subgraph
+        else:
+            return validate_subgraph(connector_subgraph)
+
+    @staticmethod
+    def get_match_subgraph(complete_graph, match_id):
+        # get the subgraph (until player level) associated with the relevant match
+        connector_subgraph, _ = dgl.khop_in_subgraph(complete_graph,
+                                                     nodes={'match': match_id},
+                                                     k=2,
+                                                     store_ids=True)
+
+        return connector_subgraph
+
+    def flip_subgraph_edges(self, connector_subgraph):
+        # add opposite edges to get the complete undirected graph
+        connector_subgraph = flip_edges(connector_subgraph,
+                                        orig_etype=self.membership_etypes['forward'],
+                                        rev_etype=self.membership_etypes['backwards'])
+        connector_subgraph = flip_edges(connector_subgraph,
+                                        orig_etype=self.opponents_etypes['forward'],
+                                        rev_etype=self.opponents_etypes['backwards'])
+        return connector_subgraph
 
     def get_updated_memory(self, nodes, messages):
         # Aggregate messages for the same nodes
@@ -405,35 +432,19 @@ class TGN(torch.nn.Module):
 
     def get_raw_messages(self,
                          pair_graph,
-                         etype,
                          player_node_ids,
-                         match_node_ids,
-                         edge_times):
-        edge_features = torch.cat(
-            [pair_graph.edges[etype].data['feats'], pair_graph.edges[etype].data['result'].unsqueeze(dim=1)],
-            dim=1)
+                         match_node_id,
+                         edge_time):
 
-        cur_memory = self.memory.get_memory(player_node_ids)
-        time_delta = edge_times - self.memory.last_update[player_node_ids]
-        time_delta_encoding = self.time_encoder(time_delta.unsqueeze(dim=1)).view(len(
-            player_node_ids), -1)
-
-        raw_messages = torch.cat([cur_memory, edge_features, time_delta_encoding],
-                                 dim=1)
         raw_messages_dict = defaultdict(list)
 
         for i in range(len(player_node_ids)):
             # this hack is meant to make sure we only store a single new raw message at a time per node
             # TODO: is it still required?
-            raw_messages_dict[player_node_ids[i]] = [{'message_feats': raw_messages[i],
-                                                      'ts': edge_times[i],
-                                                      'match_nid': match_node_ids[i]
-                                                      }]
-
-            # raw_messages_dict[player_node_ids[i]].append({'message_feats': raw_messages[i],
-            #                                               'ts': edge_times[i],
-            #                                               'match_nid': match_node_ids[i]
-            #                                               })
+            raw_messages_dict[player_node_ids[i]] = [{
+                'ts': edge_time,
+                'match_nid': match_node_id
+            }]
 
         return raw_messages_dict
 
