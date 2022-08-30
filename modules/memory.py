@@ -8,13 +8,15 @@ from copy import deepcopy
 class Memory(nn.Module):
 
     def __init__(self, n_nodes, memory_dimension, input_dimension, message_dimension=None,
-                 device="cpu"):
+                 device="cpu", time_init: float = -1.0, debug_mode: bool = False):
         super(Memory, self).__init__()
         self.n_nodes = n_nodes
         self.memory_dimension = memory_dimension
         self.input_dimension = input_dimension
         self.message_dimension = message_dimension
+        self.time_init = time_init
         self.device = device
+        self.debug = debug_mode
 
         self.__init_memory__()
 
@@ -28,7 +30,7 @@ class Memory(nn.Module):
 
         self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
                                    requires_grad=False)
-        self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
+        self.last_update = nn.Parameter(self.time_init * torch.ones(self.n_nodes).to(self.device),
                                         requires_grad=False)
         self.last_match_id = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
                                           requires_grad=False)
@@ -39,11 +41,24 @@ class Memory(nn.Module):
         for node in nodes:
             self.raw_messages_storage[node].extend(node_id_to_raw_message[node])
 
+        if self.debug:
+            # sanity check
+            assert max([len(n) for n in self.raw_messages_storage.values()]) <= 1
+
+    def store_uniform_raw_info(self, nodes, raw_info):
+        for node in nodes:
+            self.raw_messages_storage[node].extend([raw_info])
+
         # sanity check
-        assert max([len(n) for n in self.raw_messages_storage.values()]) <= 1
+        if self.debug:
+            assert max([len(n) for n in self.raw_messages_storage.values()]) <= 1
 
     def get_memory(self, node_ids):
-        return self.memory[node_ids, :]
+        mem = self.memory[node_ids, :]
+        # set initial memory (for nodes which weren't updated before)
+        mem[self.last_update[node_ids] == self.time_init] = self.default_memory
+
+        return mem
 
     def set_memory(self, node_ids, values):
         self.memory[node_ids, :] = values
