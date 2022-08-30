@@ -1,3 +1,4 @@
+import time
 import torch
 import dgl
 
@@ -64,8 +65,11 @@ class TemporalSampler(BlockSampler):
                          seed_nodes,
                          timestamp,
                          is_last: bool):
-        full_neighbor_subgraph = dgl.out_subgraph(g, seed_nodes)  # TODO: can we ditch this?
-        full_neighbor_subgraph = dgl.in_subgraph(g, seed_nodes)
+
+        if block_id % 2 == 0:
+            full_neighbor_subgraph = dgl.in_subgraph(g, seed_nodes)
+        else:
+            full_neighbor_subgraph = dgl.out_subgraph(g, seed_nodes)
 
         # not sure why is it required?
         # full_neighbor_subgraph = dgl.add_edges(full_neighbor_subgraph,
@@ -95,6 +99,7 @@ class TemporalSampler(BlockSampler):
 
         mapped_seed_nodes = {}  # per node type
         for ntype in root2sub_dict.keys():
+            # TODO: this line isn't necessary
             temporal_subgraph.nodes[ntype].data[dgl.NID] = g.nodes[ntype].data[dgl.NID][temp2origin[ntype]]
             mapped_seed_nodes[ntype] = torch.stack([root2sub_dict[ntype][int(n)] for n in seed_nodes[ntype]]) if len(
                 seed_nodes[ntype]) > 0 else seed_nodes[ntype]
@@ -103,7 +108,7 @@ class TemporalSampler(BlockSampler):
         # seed_nodes = [root2sub_dict[int(n)] for n in seed_nodes]
         final_subgraph = self.sampler(g=temporal_subgraph, nodes=mapped_seed_nodes)
 
-        # TODO: comment for a second
+        # TODO: why do we need this? why do we need to keep this nodes in the first place?
         # removing the original edges
         if is_last:
             for edge_type in final_subgraph.canonical_etypes:
@@ -224,36 +229,44 @@ class TemporalEdgeCollator(EdgeCollator):
     """
 
     def _collate(self, items):
+        # `items` is a dict specifying which edges (by index) are part of the batch, and should be considered, where the
+        # keys are the corresponding edge type, i.e. for each edge type `items` specifies what are the relevant edges.
+
+        # timings = dict()
+
+        # t_start = time.time()
         if isinstance(items[0], tuple):
             # returns a list of pairs: group them by node types into a dict
             items = utils.group_as_dict(items)
         items = utils.prepare_tensor_or_dict(self.g_sampling, items, 'items')
+        # timings['items_organization'] = time.time() - t_start
 
         # Here node id will not change
-        pair_graph = self.g.edge_subgraph(items, relabel_nodes=False)
-        induced_edges = pair_graph.edata[dgl.EID]
+        # t_start = time.time()
+        pair_graph = self.g.edge_subgraph(items, store_ids=True)
+        complete_subgraph, _ = dgl.khop_in_subgraph(self.g, nodes={'match': pair_graph.ndata[dgl.NID]['match']}, k=2,
+                                                    store_ids=True)
+        # timings['getting_subgraph'] = time.time() - t_start
 
-        pair_graph = dgl.transforms.compact_graphs(
-            [pair_graph])[0]
-
-        # Need to remap id TODO: not sure if required
-        # for ntype in self.g.ntypes:
-        #     pair_graph.nodes[ntype].data[dgl.NID] = pair_graph.nodes(ntype)
-        for etype in induced_edges.keys():
-            pair_graph.edges[etype].data[dgl.EID] = induced_edges[etype]
-
+        # t_start = time.time()
         assert len(items) == 1  # only a single edge type
         assert len(torch.unique(pair_graph.edata['timestamp'][list(items.keys())[0]])) == 1  # only a single timestamp
+        # timings['assertions_check'] = time.time() - t_start
 
-        for etype in items.keys():  # should be a single iteration
-            all_sources, all_dest = self.g.edges(etype=etype)
-            ts = pair_graph.edges[etype].data['timestamp'][0]  # applies to the rest of the batch
-            input_nodes, output_nodes, blocks = self.graph_sampler.sample_blocks(self.g_sampling,
-                                                                                 {etype[0]: all_sources[
-                                                                                     items[etype]],
-                                                                                  etype[-1]: all_dest[items[etype]]},
-                                                                                 timestamp=ts,
-                                                                                 etype=etype)
+        # t_start = time.time()
+        if True:
+            blocks = None
+            input_nodes = None
+        else:
+            for etype in items.keys():  # should be a single iteration
+                ts = pair_graph.edges[etype].data['timestamp'][0]  # applies to the rest of the batch
+                seed_nodes = {'team': pair_graph.ndata[dgl.NID]['team']}
+                input_nodes, output_nodes, blocks = self.graph_sampler.sample_blocks(self.g_sampling,
+                                                                                     seed_nodes=seed_nodes,
+                                                                                     timestamp=ts,
+                                                                                     etype=etype)
+
+        # timings['blocks_sampling'] = time.time() - t_start
 
         # for i, edge in enumerate(zip(self.g.edges()[0][items], self.g.edges()[1][items])):
         #     ts = pair_graph.edata['timestamp'][i]
@@ -265,7 +278,7 @@ class TemporalEdgeCollator(EdgeCollator):
         #     nodes_id.append(subg.srcdata[dgl.NID])
         #     batch_graphs.append(subg)
 
-        return input_nodes, pair_graph, blocks
+        return input_nodes, complete_subgraph, blocks  # , timings
 
     def _collate_with_negative_sampling(self, items):
         items = _prepare_tensor(self.g_sampling, items, 'items', False)
