@@ -4,7 +4,7 @@ from modules.custom import LayerNormGRUCell
 
 
 class MemoryUpdater(nn.Module):
-    def update_memory(self, unique_node_ids, unique_messages, timestamps):
+    def update_and_store_memory(self, unique_node_ids, unique_messages, timestamps):
         pass
 
 
@@ -16,10 +16,9 @@ class SequenceMemoryUpdater(MemoryUpdater):
         self.message_dimension = message_dimension
         self.device = device
 
-    def update_memory(self, unique_node_ids, unique_messages, timestamps):
+    def update_and_store_memory(self, unique_node_ids, unique_messages, timestamps):
         if len(unique_node_ids) <= 0:
             return
-
         assert (self.memory.get_last_update(unique_node_ids) <= timestamps).all().item(), "Trying to " \
                                                                                           "update memory to time in the past"
 
