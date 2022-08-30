@@ -40,22 +40,20 @@ class LastMessageAggregator(MessageAggregator):
         """Only keep the last message for each node"""
 
         to_update_node_ids = []
-        messages_feats = []
         messages_ts = []
         connector_node_ids = []
 
         for node_id in node_ids:
             if len(raw_message_storage[node_id]) > 0:
                 to_update_node_ids.append(node_id)
-                messages_feats.append(raw_message_storage[node_id][-1]['message_feats'])
-                messages_ts.append(raw_message_storage[node_id][-1]['ts'])
-                connector_node_ids.append(raw_message_storage[node_id][-1]['match_nid'])
+                rms = raw_message_storage[node_id][-1]
+                messages_ts.append(rms['ts'])
+                connector_node_ids.append(rms['match_nid'])
 
-        messages_feats = torch.stack(messages_feats) if len(to_update_node_ids) > 0 else []
         messages_ts = torch.stack(messages_ts) if len(to_update_node_ids) > 0 else []
         connector_node_ids = np.stack(connector_node_ids) if len(to_update_node_ids) > 0 else []
 
-        return np.array(to_update_node_ids), messages_feats, messages_ts, connector_node_ids
+        return np.array(to_update_node_ids), messages_ts, connector_node_ids
 
 
 class MeanMessageAggregator(MessageAggregator):
