@@ -203,8 +203,8 @@ if __name__ == "__main__":
 
     print('Loading metadata file (if exists)')
     t_start = time.time()
-    meta_file = os.path.join(data_path, 'mini_complete_meta.pickle')
-    # meta_file = os.path.join(data_path, 'all_complete_meta.pickle')
+    # meta_file = os.path.join(data_path, 'mini_complete_meta.pickle')
+    meta_file = os.path.join(data_path, 'all_complete_meta.pickle')
     if os.path.exists(meta_file):
         with open(meta_file, 'rb') as handle:
             loaded_meta = pickle.load(handle)
@@ -214,8 +214,8 @@ if __name__ == "__main__":
 
     print('Loading graph object from disk')
     t_start = time.time()
-    gs, _ = dgl.load_graphs(os.path.join(data_path, 'mini_complete_matches.bin'))
-    # gs, _ = dgl.load_graphs(os.path.join(data_path, 'complete_matches.bin'))
+    # gs, _ = dgl.load_graphs(os.path.join(data_path, 'mini_complete_matches.bin'))
+    gs, _ = dgl.load_graphs(os.path.join(data_path, 'complete_matches.bin'))
     data = gs[0]
     print(f"Endured {(time.time() - t_start):.3f} Seconds")
 
